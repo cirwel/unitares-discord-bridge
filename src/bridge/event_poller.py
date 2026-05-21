@@ -98,20 +98,34 @@ class EventPoller:
                     await self.cache.set_event_cursor(0)
                     return
             for event in events:
-                embed = event_to_embed(event)
-                is_finding = event.get("type", "").endswith("_finding")
-                if is_finding and self.residents_channel is not None:
-                    await self._message_queue.put((self.residents_channel, embed))
-                else:
-                    bucket = classify_rest_event(event)
-                    target = (
-                        self.activity_channel if bucket == "activity"
-                        else self.signals_channel
+                # Per-event try/except: a single malformed event (e.g. a
+                # drift_alert with value=null that used to crash the embed
+                # builder) must not stall the whole batch or block the cursor
+                # — otherwise the next poll fetches the same poisoned batch
+                # and the feed stays silent forever.
+                try:
+                    embed = event_to_embed(event)
+                    is_finding = event.get("type", "").endswith("_finding")
+                    if is_finding and self.residents_channel is not None:
+                        await self._message_queue.put((self.residents_channel, embed))
+                    else:
+                        bucket = classify_rest_event(event)
+                        target = (
+                            self.activity_channel if bucket == "activity"
+                            else self.signals_channel
+                        )
+                        await self._message_queue.put((target, embed))
+                    if is_critical_event(event):
+                        await self._message_queue.put((self.alerts_channel, embed))
+                except Exception as exc:
+                    log.error(
+                        "Failed to dispatch event %s (type=%s): %s",
+                        event.get("event_id"), event.get("type"), exc,
+                        exc_info=exc,
                     )
-                    await self._message_queue.put((target, embed))
-                if is_critical_event(event):
-                    await self._message_queue.put((self.alerts_channel, embed))
             if events:
+                # Advance past every fetched event — including ones that failed
+                # to dispatch — so a poison-pill can't lock the cursor.
                 await self.cache.set_event_cursor(
                     max(e["event_id"] for e in events)
                 )
@@ -130,7 +144,7 @@ class EventPoller:
                 )
                 await self._message_queue.put((self.alerts_channel, recovered))
         except Exception as exc:
-            log.error("Event poll error: %s", exc)
+            log.error("Event poll error: %s", exc, exc_info=exc)
 
     async def _send_loop(self) -> None:
         while True:

@@ -113,6 +113,45 @@ def test_classify_rest_event_unknown_defaults_to_signals():
     assert classify_rest_event({}) == "signals"
 
 
+def test_drift_alert_with_null_value_does_not_crash():
+    # Regression: governance can emit drift_alert with value=null when the
+    # underlying metric reading is unavailable. The embed builder previously
+    # raised TypeError on `f"{None:.2f}"`, which stalled the entire REST
+    # event feed because the poll cursor never advanced past it.
+    event = {
+        "event_id": 42, "type": "drift_alert", "severity": "warning",
+        "message": "drift", "agent_id": "a", "agent_name": "A",
+        "axis": "I", "value": None,
+    }
+    embed = event_to_embed(event)
+    value_field = next(f for f in embed.fields if f.name == "Value")
+    assert value_field.value == "0.00"
+
+
+def test_risk_threshold_with_null_value_does_not_crash():
+    event = {
+        "event_id": 43, "type": "risk_threshold", "severity": "warning",
+        "message": "risk", "agent_id": "a", "agent_name": "A",
+        "direction": "up", "value": None,
+    }
+    embed = event_to_embed(event)
+    risk_field = next(f for f in embed.fields if f.name == "Risk")
+    assert risk_field.value == "0%"
+
+
+def test_drift_alert_with_string_value_does_not_crash():
+    # Defense in depth: non-numeric scalars (a stringified number, an empty
+    # string, a dict) should fall back to 0.0 rather than raise.
+    event = {
+        "event_id": 44, "type": "drift_alert", "severity": "warning",
+        "message": "drift", "agent_id": "a", "agent_name": "A",
+        "axis": "S", "value": "not-a-number",
+    }
+    embed = event_to_embed(event)
+    value_field = next(f for f in embed.fields if f.name == "Value")
+    assert value_field.value == "0.00"
+
+
 def test_event_without_agent_name_falls_back_to_id_and_description():
     event = {
         "event_id": 28,

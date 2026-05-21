@@ -40,6 +40,23 @@ def _event_agent(event: dict) -> str:
     )
 
 
+def _safe_float(value, default: float = 0.0) -> float:
+    """Coerce a value to float, returning *default* for None / non-numeric.
+
+    Governance can emit metric events (drift_alert, risk_threshold) with an
+    explicit ``"value": null`` when the underlying reading is unavailable.
+    Passing that through ``f"{x:.2f}"`` raises ``TypeError`` and — until this
+    helper existed — stalled the entire REST event feed because the poll
+    cursor never advanced past the poison-pill event.
+    """
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def event_to_embed(event: dict) -> discord.Embed:
     """Convert a governance event dict to a Discord embed."""
     severity = event.get("severity", "info")
@@ -63,11 +80,11 @@ def event_to_embed(event: dict) -> discord.Embed:
             inline=False,
         )
     elif event_type == "risk_threshold":
-        embed.add_field(name="Risk", value=f"{event.get('value', 0):.0%}", inline=True)
+        embed.add_field(name="Risk", value=f"{_safe_float(event.get('value')):.0%}", inline=True)
         embed.add_field(name="Direction", value=event.get("direction", "?"), inline=True)
     elif event_type == "drift_alert":
         embed.add_field(name="Axis", value=event.get("axis", "?"), inline=True)
-        embed.add_field(name="Value", value=f"{event.get('value', 0):.2f}", inline=True)
+        embed.add_field(name="Value", value=f"{_safe_float(event.get('value')):.2f}", inline=True)
     elif event_type == "sentinel_finding":
         if event.get("violation_class"):
             embed.add_field(name="Violation", value=event["violation_class"], inline=True)

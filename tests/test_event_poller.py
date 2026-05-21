@@ -237,6 +237,43 @@ async def test_cursor_not_reset_when_server_still_ahead():
 
 
 @pytest.mark.asyncio
+async def test_poison_pill_event_does_not_block_cursor_or_batch():
+    # Regression: a single event that raises inside the dispatch path
+    # (here simulated by patching event_to_embed to raise on event_id=2)
+    # must not stall the rest of the batch and — critically — must not
+    # prevent the cursor from advancing. Otherwise the next poll re-fetches
+    # the same poisoned batch and the entire REST feed goes silent.
+    from unittest.mock import patch
+    poller, routed = _make_poller(
+        [{"event_id": 1, "type": "agent_new", "severity": "info",
+          "message": "m", "agent_id": "a", "agent_name": "A"},
+         {"event_id": 2, "type": "drift_alert", "severity": "warning",
+          "message": "m", "agent_id": "b", "agent_name": "B",
+          "axis": "I", "value": None},
+         {"event_id": 3, "type": "agent_idle", "severity": "info",
+          "message": "m", "agent_id": "c", "agent_name": "C"}],
+    )
+
+    real_event_to_embed = __import__(
+        "bridge.embeds", fromlist=["event_to_embed"]
+    ).event_to_embed
+
+    def fake_embed(event):
+        if event.get("event_id") == 2:
+            raise TypeError("simulated poison-pill")
+        return real_event_to_embed(event)
+
+    with patch("bridge.event_poller.event_to_embed", side_effect=fake_embed):
+        await poller._poll_loop_once()
+
+    # Events 1 and 3 reached their channels; event 2 was skipped.
+    channels_hit = [name for name, _ in routed]
+    assert channels_hit.count("activity") == 2
+    # Cursor advances past the poison-pill so we don't re-fetch it next poll.
+    poller.cache.set_event_cursor.assert_awaited_once_with(3)
+
+
+@pytest.mark.asyncio
 async def test_mixed_event_ids_renders_int_only_and_advances_cursor():
     poller, routed = _make_poller(
         [{"event_id": "uuid-thing", "type": "cross_device_call", "severity": "info",

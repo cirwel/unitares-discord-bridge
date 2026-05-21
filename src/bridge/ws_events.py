@@ -342,7 +342,16 @@ class WSEventSubscriber:
                             continue
                         if not isinstance(event, dict):
                             continue
-                        await self._dispatch(event)
+                        # Isolate per-event failures so a single malformed
+                        # payload can't tear down the WS and trigger a
+                        # reconnect churn.
+                        try:
+                            await self._dispatch(event)
+                        except Exception as exc:
+                            log.error(
+                                "WS events: dispatch failed for type=%s: %s",
+                                event.get("type"), exc, exc_info=exc,
+                            )
             except asyncio.CancelledError:
                 raise
             except websockets.exceptions.ConnectionClosed as exc:
