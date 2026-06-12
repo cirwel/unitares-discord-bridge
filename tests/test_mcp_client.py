@@ -401,3 +401,139 @@ async def test_fetch_metrics_does_not_query_for_empty_id():
     assert args[1]["agent_id"] == "uuid-a"
     assert "uuid-a" in metrics
     assert "" not in metrics
+
+
+# --- onboard / identity binding tests ---
+
+def _onboard_response(uuid="uuid-new", session_id="agent-new-1"):
+    return make_mock_response(json_data={
+        "name": "onboard",
+        "result": {"success": True, "uuid": uuid, "client_session_id": session_id},
+    })
+
+
+@pytest.mark.asyncio
+async def test_onboard_mints_and_persists_identity(tmp_path):
+    """onboard() sets agent_uuid/client_session_id and writes the sidecar."""
+    import json as _json
+
+    identity_path = str(tmp_path / "governance_identity.json")
+    resp = _onboard_response(uuid="uuid-1", session_id="sess-1")
+
+    with mock_httpx_client("post", resp):
+        gov = GovernanceClient("http://localhost:8767")
+        ok = await gov.onboard(identity_path)
+
+    assert ok is True
+    assert gov.agent_uuid == "uuid-1"
+    assert gov.client_session_id == "sess-1"
+    with open(identity_path) as f:
+        assert _json.load(f) == {"agent_uuid": "uuid-1"}
+
+
+@pytest.mark.asyncio
+async def test_onboard_declares_lineage_from_sidecar(tmp_path):
+    """A prior instance's UUID is declared as parent_agent_id."""
+    import json as _json
+
+    identity_path = str(tmp_path / "governance_identity.json")
+    with open(identity_path, "w") as f:
+        _json.dump({"agent_uuid": "uuid-prior"}, f)
+
+    resp = _onboard_response(uuid="uuid-2")
+    mock_client_instance = AsyncMock()
+    mock_client_instance.post.return_value = resp
+    mock_client_instance.aclose = AsyncMock()
+    with patch("bridge.mcp_client.httpx.AsyncClient", MagicMock(return_value=mock_client_instance)):
+        gov = GovernanceClient("http://localhost:8767")
+        ok = await gov.onboard(identity_path)
+
+    assert ok is True
+    sent = mock_client_instance.post.call_args.kwargs["json"]
+    assert sent["name"] == "onboard"
+    assert sent["arguments"]["parent_agent_id"] == "uuid-prior"
+    assert sent["arguments"]["force_new"] is True
+    assert sent["arguments"]["spawn_reason"] == "new_session"
+    # Sidecar now carries the new uuid for the NEXT instance.
+    with open(identity_path) as f:
+        assert _json.load(f)["agent_uuid"] == "uuid-2"
+
+
+@pytest.mark.asyncio
+async def test_onboard_fresh_omits_parent(tmp_path):
+    """No sidecar file → no parent_agent_id (honest fresh mint)."""
+    identity_path = str(tmp_path / "governance_identity.json")
+    resp = _onboard_response()
+    mock_client_instance = AsyncMock()
+    mock_client_instance.post.return_value = resp
+    mock_client_instance.aclose = AsyncMock()
+    with patch("bridge.mcp_client.httpx.AsyncClient", MagicMock(return_value=mock_client_instance)):
+        gov = GovernanceClient("http://localhost:8767")
+        await gov.onboard(identity_path)
+
+    sent = mock_client_instance.post.call_args.kwargs["json"]
+    assert "parent_agent_id" not in sent["arguments"]
+
+
+@pytest.mark.asyncio
+async def test_onboard_failure_leaves_bridge_unbound(tmp_path):
+    """A failed onboard is non-fatal: no identity set, no sidecar written."""
+    import os as _os
+
+    identity_path = str(tmp_path / "governance_identity.json")
+    with mock_httpx_client_error("post", Exception("connection refused")):
+        gov = GovernanceClient("http://localhost:8767")
+        ok = await gov.onboard(identity_path)
+
+    assert ok is False
+    assert gov.agent_uuid is None
+    assert gov.client_session_id is None
+    assert not _os.path.exists(identity_path)
+
+
+@pytest.mark.asyncio
+async def test_call_tool_echoes_client_session_id():
+    """After onboarding, every call_tool carries client_session_id."""
+    resp = make_mock_response(json_data={"result": {}})
+    mock_client_instance = AsyncMock()
+    mock_client_instance.post.return_value = resp
+    mock_client_instance.aclose = AsyncMock()
+    with patch("bridge.mcp_client.httpx.AsyncClient", MagicMock(return_value=mock_client_instance)):
+        gov = GovernanceClient("http://localhost:8767")
+        gov.client_session_id = "sess-echo"
+        await gov.call_tool("list_agents", {"lite": True})
+
+    sent = mock_client_instance.post.call_args.kwargs["json"]
+    assert sent["arguments"]["client_session_id"] == "sess-echo"
+    assert sent["arguments"]["lite"] is True
+
+
+@pytest.mark.asyncio
+async def test_call_tool_does_not_override_explicit_session_id():
+    """An explicitly passed client_session_id wins over the bound one."""
+    resp = make_mock_response(json_data={"result": {}})
+    mock_client_instance = AsyncMock()
+    mock_client_instance.post.return_value = resp
+    mock_client_instance.aclose = AsyncMock()
+    with patch("bridge.mcp_client.httpx.AsyncClient", MagicMock(return_value=mock_client_instance)):
+        gov = GovernanceClient("http://localhost:8767")
+        gov.client_session_id = "sess-bound"
+        await gov.call_tool("onboard", {"client_session_id": "sess-explicit"})
+
+    sent = mock_client_instance.post.call_args.kwargs["json"]
+    assert sent["arguments"]["client_session_id"] == "sess-explicit"
+
+
+@pytest.mark.asyncio
+async def test_call_tool_unbound_does_not_inject():
+    """Before onboarding, arguments pass through untouched."""
+    resp = make_mock_response(json_data={"result": {}})
+    mock_client_instance = AsyncMock()
+    mock_client_instance.post.return_value = resp
+    mock_client_instance.aclose = AsyncMock()
+    with patch("bridge.mcp_client.httpx.AsyncClient", MagicMock(return_value=mock_client_instance)):
+        gov = GovernanceClient("http://localhost:8767")
+        await gov.call_tool("list_agents", {"lite": True})
+
+    sent = mock_client_instance.post.call_args.kwargs["json"]
+    assert "client_session_id" not in sent["arguments"]
