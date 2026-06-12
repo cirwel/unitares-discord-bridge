@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 
 import httpx
 
@@ -15,11 +16,20 @@ class GovernanceClient:
 
     Uses a persistent httpx.AsyncClient for connection pooling.
     Call ``open()`` before use and ``close()`` on shutdown.
+
+    The bridge onboards a governance identity at startup (``onboard()``)
+    and echoes the returned ``client_session_id`` on every tool call so
+    its traffic is bound instead of anonymous. Per the identity.md v2
+    ontology each bridge process-instance mints fresh with declared
+    lineage: the previous instance's UUID is persisted to a sidecar file
+    and passed as ``parent_agent_id`` on the next start.
     """
 
     def __init__(self, base_url: str, token: str = ""):
         self.base_url = base_url.rstrip("/")
         self.consecutive_failures = 0
+        self.agent_uuid: str | None = None
+        self.client_session_id: str | None = None
         self._client: httpx.AsyncClient | None = None
         self._headers: dict[str, str] = {}
         if token:
@@ -106,9 +116,74 @@ class GovernanceClient:
             if self._client is None:
                 await client.aclose()
 
+    async def onboard(self, identity_path: str) -> bool:
+        """Mint a governance identity for this bridge process-instance.
+
+        Reads the previous instance's UUID from ``identity_path`` (JSON
+        sidecar) and declares it as ``parent_agent_id``; persists the
+        newly minted UUID for the next instance. Sets ``agent_uuid`` and
+        ``client_session_id`` on success so ``call_tool`` binds every
+        subsequent call. Best-effort: on any failure the bridge keeps
+        running unbound (its reads are pre-onboard-exempt server-side).
+        """
+        parent_uuid = None
+        try:
+            with open(identity_path) as f:
+                parent_uuid = json.load(f).get("agent_uuid") or None
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            log.warning("governance identity file unreadable (%s): %s", identity_path, exc)
+
+        arguments: dict = {
+            "force_new": True,
+            "name": "discord-bridge",
+            "client_hint": "discord-bridge",
+            "spawn_reason": "new_session",
+        }
+        if parent_uuid:
+            arguments["parent_agent_id"] = parent_uuid
+
+        result = await self.call_tool("onboard", arguments)
+        if result is None:
+            log.warning("governance onboard failed — bridge continues unbound")
+            return False
+        try:
+            data = parse_tool_result(result)
+            uuid = data.get("uuid") if isinstance(data, dict) else None
+            session_id = data.get("client_session_id") if isinstance(data, dict) else None
+            if not uuid:
+                log.warning("governance onboard returned no uuid: %s", data)
+                return False
+        except (json.JSONDecodeError, TypeError, KeyError) as exc:
+            log.warning("governance onboard response unparseable: %s", exc)
+            return False
+
+        self.agent_uuid = uuid
+        self.client_session_id = session_id
+        try:
+            os.makedirs(os.path.dirname(identity_path) or ".", exist_ok=True)
+            with open(identity_path, "w") as f:
+                json.dump({"agent_uuid": uuid}, f)
+        except Exception as exc:
+            # Identity still works for this process; only next-start lineage
+            # is lost.
+            log.warning("could not persist governance identity to %s: %s", identity_path, exc)
+        log.info(
+            "governance onboarded as %s (lineage: %s)",
+            uuid, parent_uuid or "fresh",
+        )
+        return True
+
     async def call_tool(self, tool_name: str, arguments: dict) -> dict | None:
         """POST /v1/tools/call with {"name": ..., "arguments": ...}. Returns None on error."""
         client = self._get_client()
+        if (
+            self.client_session_id
+            and isinstance(arguments, dict)
+            and "client_session_id" not in arguments
+        ):
+            arguments = {**arguments, "client_session_id": self.client_session_id}
         try:
             resp = await client.post(
                 "/v1/tools/call",

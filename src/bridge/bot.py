@@ -76,6 +76,14 @@ async def on_ready():
     await gov_client.open()
     await anima_client.open()
 
+    # Mint this process-instance's governance identity (declared lineage to
+    # the previous instance via the sidecar file). Best-effort: an unbound
+    # bridge still works, it just polls anonymously.
+    identity_path = os.path.join(
+        os.path.dirname(DB_PATH) or "data", "governance_identity.json",
+    )
+    await gov_client.onboard(identity_path)
+
     # Fetch the violation taxonomy before creating channels so the VIOLATIONS
     # category is populated (if class routing is enabled). Best-effort — a
     # missing taxonomy just skips the violations category.
