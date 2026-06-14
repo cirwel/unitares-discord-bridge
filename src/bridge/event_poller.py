@@ -7,6 +7,7 @@ import logging
 
 import discord
 
+from bridge import config
 from bridge.cache import BridgeCache
 from bridge.embeds import classify_rest_event, event_to_embed, is_critical_event
 from bridge.mcp_client import GovernanceClient
@@ -98,6 +99,11 @@ class EventPoller:
                     await self.cache.set_event_cursor(0)
                     return
             for event in events:
+                # Drop suppressed (noisy) event types — e.g. knowledge_read —
+                # before posting. The cursor still advances over them below, so
+                # they're skipped, not re-fetched.
+                if event.get("type") in config.SUPPRESSED_EVENT_TYPES:
+                    continue
                 # Per-event try/except: a single malformed event (e.g. a
                 # drift_alert with value=null that used to crash the embed
                 # builder) must not stall the whole batch or block the cursor

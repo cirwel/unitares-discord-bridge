@@ -28,6 +28,16 @@ DIGEST_RELATIONAL_THRESHOLD = int(os.environ.get("LUMEN_DIGEST_RELATIONAL_THRESH
 
 DB_PATH = os.environ.get("BRIDGE_DB_PATH", "data/bridge.db")
 
+# Event types dropped before posting to Discord (comma-separated). Defaults to
+# knowledge_read — high-volume, low-signal reads (often agent=system) that spam
+# #signals even when no one is active. Knowledge *writes* (discoveries/updates)
+# are NOT suppressed. Set BRIDGE_SUPPRESSED_EVENT_TYPES="" to disable filtering.
+SUPPRESSED_EVENT_TYPES = {
+    t.strip()
+    for t in os.environ.get("BRIDGE_SUPPRESSED_EVENT_TYPES", "knowledge_read").split(",")
+    if t.strip()
+}
+
 # Per-class routing — when enabled, broadcaster events that map to a
 # violation class (via /v1/taxonomy reverse-lookup) are mirrored to a
 # class-specific text channel in addition to the main #events channel.
