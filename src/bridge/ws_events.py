@@ -32,6 +32,8 @@ import discord
 import websockets
 import websockets.exceptions
 
+from bridge import config
+
 from bridge.tasks import cancel_tasks, create_logged_task
 
 log = logging.getLogger(__name__)
@@ -373,6 +375,11 @@ class WSEventSubscriber:
         # ring buffer.
         if event.get("type") and event.get("type") != "eisv_update":
             record_event(event)
+        # Suppressed (noisy) types — e.g. knowledge_read — are recorded above for
+        # /digest aggregation but NOT posted to Discord. This is the WS twin of
+        # the REST poller's filter; knowledge_read arrives via this path.
+        if event.get("type") in config.SUPPRESSED_EVENT_TYPES:
+            return
         embed = broadcaster_event_to_embed(event)
         if embed is None:
             return
