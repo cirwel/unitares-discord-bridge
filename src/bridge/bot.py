@@ -11,6 +11,8 @@ from bridge.config import (
     GOVERNANCE_TOKEN, ANIMA_TOKEN,
     EVENT_POLL_INTERVAL, HUD_UPDATE_INTERVAL, SENSOR_POLL_INTERVAL, DB_PATH,
     CLASS_ROUTING_ENABLED, LEASE_PLANE_PHASE_B_CHANNEL_ID,
+    DIGEST_ENABLED, DIGEST_INTERVAL, DIGEST_WINDOW, DIGEST_CHECK_INTERVAL,
+    DIGEST_RELATIONAL_THRESHOLD,
 )
 from bridge.cache import BridgeCache
 from bridge.mcp_client import GovernanceClient, AnimaClient
@@ -18,6 +20,7 @@ from bridge.server_setup import ensure_server_structure
 from bridge.event_poller import EventPoller
 from bridge.hud import HUDUpdater
 from bridge.lumen import LumenPoller
+from bridge.digest import LumenDigestPoller
 from bridge.commands import setup_commands
 from bridge.ws_events import WSEventSubscriber
 
@@ -52,13 +55,14 @@ event_poller: EventPoller | None = None
 ws_subscriber: WSEventSubscriber | None = None
 hud_updater: HUDUpdater | None = None
 lumen_poller: LumenPoller | None = None
+digest_poller: LumenDigestPoller | None = None
 audit_channel: discord.TextChannel | None = None
 _initialized: bool = False
 
 
 @bot.event
 async def on_ready():
-    global cache, event_poller, ws_subscriber, hud_updater, lumen_poller, audit_channel, _initialized
+    global cache, event_poller, ws_subscriber, hud_updater, lumen_poller, digest_poller, audit_channel, _initialized
 
     if _initialized:
         log.info("Reconnected as %s (skipping re-init)", bot.user)
@@ -193,6 +197,19 @@ async def on_ready():
         await lumen_poller.start()
         log.info("Lumen poller started")
 
+    # Start the Lumen Q&A digest if enabled and its channel exists
+    digest_ch = channels.get("lumen-digest")
+    if DIGEST_ENABLED and digest_ch and cache is not None:
+        digest_poller = LumenDigestPoller(
+            anima_client, digest_ch, cache,
+            interval=DIGEST_INTERVAL,
+            window=DIGEST_WINDOW,
+            check_interval=DIGEST_CHECK_INTERVAL,
+            relational_nudge_threshold=DIGEST_RELATIONAL_THRESHOLD,
+        )
+        await digest_poller.start()
+        log.info("Lumen digest poller started")
+
     # Sync the slash command tree
     try:
         await bot.tree.sync()
@@ -202,7 +219,7 @@ async def on_ready():
 
     # Post startup message to audit log
     if audit_channel:
-        active = [n for n, c in [("events", event_poller), ("ws", ws_subscriber), ("HUD", hud_updater), ("Lumen", lumen_poller)] if c]
+        active = [n for n, c in [("events", event_poller), ("ws", ws_subscriber), ("HUD", hud_updater), ("Lumen", lumen_poller), ("digest", digest_poller)] if c]
         embed = discord.Embed(
             title="Bridge Online",
             description=f"Systems active: {', '.join(active) or 'none'}",
@@ -221,7 +238,7 @@ async def on_ready():
 
 async def shutdown_bridge() -> None:
     """Graceful shutdown: stop all background tasks and close the cache."""
-    global cache, event_poller, ws_subscriber, hud_updater, lumen_poller, audit_channel, _initialized
+    global cache, event_poller, ws_subscriber, hud_updater, lumen_poller, digest_poller, audit_channel, _initialized
     log.info("Shutting down bridge...")
 
     # Post shutdown message while connection is still alive
@@ -243,6 +260,7 @@ async def shutdown_bridge() -> None:
         ("ws_subscriber", ws_subscriber),
         ("hud_updater", hud_updater),
         ("lumen_poller", lumen_poller),
+        ("digest_poller", digest_poller),
     ]:
         if component is not None:
             try:
@@ -268,6 +286,7 @@ async def shutdown_bridge() -> None:
     ws_subscriber = None
     hud_updater = None
     lumen_poller = None
+    digest_poller = None
     audit_channel = None
     _initialized = False
 

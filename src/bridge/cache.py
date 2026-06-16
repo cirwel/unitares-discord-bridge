@@ -71,6 +71,27 @@ class BridgeCache:
         )
         await self._db.commit()
 
+    # -- generic key/value ---------------------------------------------------
+
+    async def get_kv(self, key: str) -> str | None:
+        """Return the stored string for ``key``, or None if absent."""
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT value FROM kv WHERE key = ?", (key,)
+        ) as cur:
+            row = await cur.fetchone()
+        return row[0] if row else None
+
+    async def set_kv(self, key: str, value: str) -> None:
+        """Upsert a string value under ``key``."""
+        assert self._db is not None
+        await self._db.execute(
+            "INSERT INTO kv (key, value) VALUES (?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+        await self._db.commit()
+
     # -- HUD message ---------------------------------------------------------
 
     async def get_hud_message(self) -> tuple[int, int] | None:

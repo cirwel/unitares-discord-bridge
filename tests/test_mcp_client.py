@@ -537,3 +537,31 @@ async def test_call_tool_unbound_does_not_inject():
 
     sent = mock_client_instance.post.call_args.kwargs["json"]
     assert "client_session_id" not in sent["arguments"]
+
+
+@pytest.mark.asyncio
+async def test_anima_fetch_qa():
+    payload = {
+        "questions": [
+            {"id": "a1", "question": "why am I alone?", "answered": False,
+             "timestamp": 1708700000, "answer": None},
+        ],
+        "total": 1,
+        "unanswered": 1,
+    }
+    resp = make_mock_response(json_data=payload)
+
+    with mock_httpx_client("get", resp):
+        client = AnimaClient("http://localhost:8766")
+        result = await client.fetch_qa(limit=50)
+
+    assert result == payload
+
+
+@pytest.mark.asyncio
+async def test_anima_fetch_qa_error_returns_none():
+    with mock_httpx_client_error("get", Exception("Connection refused")):
+        client = AnimaClient("http://localhost:8766")
+        result = await client.fetch_qa()
+
+    assert result is None

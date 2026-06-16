@@ -411,3 +411,23 @@ class AnimaClient:
         finally:
             if self._client is None:
                 await client.aclose()
+
+    async def fetch_qa(self, limit: int = 50) -> dict | None:
+        """GET /qa?limit=N. Returns {questions: [...], total, unanswered}, or None.
+
+        Each question is {id, question, answered, timestamp, answer}. The /qa
+        endpoint reads the message board directly, so it is independent of the
+        KnowledgeBase insight store (which has its own retrieval quirks).
+        """
+        client = self._get_client()
+        try:
+            resp = await client.get("/qa", params={"limit": limit})
+            resp.raise_for_status()
+            data = resp.json()
+            return data if isinstance(data, dict) else None
+        except Exception as exc:
+            log.warning("anima fetch_qa failed: %s", exc)
+            return None
+        finally:
+            if self._client is None:
+                await client.aclose()
