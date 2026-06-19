@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+from datetime import datetime, timezone
 
 import discord
 
@@ -57,7 +59,23 @@ class EventPoller:
     async def _poll_loop(self) -> None:
         while True:
             await self._poll_loop_once()
+            self._write_heartbeat()
             await asyncio.sleep(self.interval)
+
+    def _write_heartbeat(self) -> None:
+        """Rewrite the liveness heartbeat after each poll iteration. An external
+        watchdog reads its mtime to tell a healthy loop from a wedged one
+        (process alive but not iterating) — independent of log verbosity.
+        Best-effort: heartbeat I/O must never break the poll loop."""
+        path = config.BRIDGE_HEARTBEAT_PATH
+        if not path:
+            return
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                fh.write(datetime.now(timezone.utc).isoformat())
+        except Exception:  # noqa: BLE001 — liveness must not depend on disk
+            log.debug("heartbeat write failed", exc_info=True)
 
     async def _poll_loop_once(self) -> None:
         try:

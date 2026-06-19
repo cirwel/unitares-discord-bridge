@@ -286,3 +286,42 @@ async def test_mixed_event_ids_renders_int_only_and_advances_cursor():
     channels_hit = [name for name, _ in routed]
     assert channels_hit == ["activity"]
     poller.cache.set_event_cursor.assert_awaited_once_with(3)
+
+
+def test_write_heartbeat_touches_file(tmp_path, monkeypatch):
+    """The liveness heartbeat is written with a parseable, fresh timestamp."""
+    import os
+    import time
+    from datetime import datetime
+
+    from bridge import config
+
+    hb = tmp_path / "sub" / "heartbeat"  # nested dir must be created
+    monkeypatch.setattr(config, "BRIDGE_HEARTBEAT_PATH", str(hb))
+
+    poller, _ = _make_poller([])
+    poller._write_heartbeat()
+
+    assert hb.exists()
+    # content parses as an ISO-8601 instant, and the file is fresh.
+    datetime.fromisoformat(hb.read_text())
+    assert time.time() - os.path.getmtime(hb) < 5
+
+
+def test_write_heartbeat_is_best_effort(monkeypatch):
+    """A heartbeat write failure must never propagate out of the poll loop."""
+    from bridge import config
+
+    # An unwritable path (root of a non-existent device-ish path) must be swallowed.
+    monkeypatch.setattr(config, "BRIDGE_HEARTBEAT_PATH", "/proc/nonexistent/heartbeat")
+    poller, _ = _make_poller([])
+    poller._write_heartbeat()  # must not raise
+
+
+def test_write_heartbeat_disabled_when_path_empty(monkeypatch):
+    """Empty BRIDGE_HEARTBEAT_PATH disables the write (no error)."""
+    from bridge import config
+
+    monkeypatch.setattr(config, "BRIDGE_HEARTBEAT_PATH", "")
+    poller, _ = _make_poller([])
+    poller._write_heartbeat()  # no-op, must not raise

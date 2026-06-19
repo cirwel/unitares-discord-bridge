@@ -56,3 +56,12 @@ CLASS_ROUTING_ENABLED = os.environ.get(
 LEASE_PLANE_PHASE_B_CHANNEL_ID = int(
     os.environ.get("DISCORD_LEASE_PLANE_PHASE_B_CHANNEL_ID", "0") or "0"
 )
+
+# Liveness heartbeat: the event poll loop rewrites this file every iteration so
+# an external watchdog can distinguish a *hung* event loop (process alive, loop
+# wedged — the 2026-06-19 silent hang) from a healthy one, independent of log
+# verbosity. Consumed by scripts/ops/bridge_liveness_watchdog.sh in the unitares
+# repo. Empty disables the heartbeat write.
+BRIDGE_HEARTBEAT_PATH = os.path.expanduser(
+    os.environ.get("BRIDGE_HEARTBEAT_PATH", "~/.unitares/discord-bridge.heartbeat")
+)
