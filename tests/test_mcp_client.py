@@ -403,6 +403,35 @@ async def test_fetch_metrics_does_not_query_for_empty_id():
     assert "" not in metrics
 
 
+@pytest.mark.asyncio
+async def test_fetch_metrics_skips_reserved_prefix_ids():
+    """A redacted reserved-prefix id (e.g. Chronicler's "mcp_<date>_<suffix>")
+    is rejected by get_governance_metrics; skip it instead of firing a
+    guaranteed reserved_prefix failure every HUD cycle.
+    """
+    from bridge.mcp_client import fetch_metrics
+
+    gov = AsyncMock()
+    gov.call_tool.return_value = {"result": {"E": 0.5, "I": 0.5, "S": 0.5, "V": 0.0}}
+
+    metrics = await fetch_metrics(
+        gov,
+        [
+            {"id": "mcp_20260423_deb879b6"},
+            {"id": "governance_resident"},
+            {"id": "uuid-a"},
+        ],
+    )
+
+    # Only the non-reserved id is queried.
+    assert gov.call_tool.await_count == 1
+    args, kwargs = gov.call_tool.await_args
+    assert args[1]["agent_id"] == "uuid-a"
+    assert "uuid-a" in metrics
+    assert "mcp_20260423_deb879b6" not in metrics
+    assert "governance_resident" not in metrics
+
+
 # --- onboard / identity binding tests ---
 
 def _onboard_response(uuid="uuid-new", session_id="agent-new-1"):

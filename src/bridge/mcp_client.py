@@ -10,6 +10,20 @@ import httpx
 
 log = logging.getLogger(__name__)
 
+# Mirrors governance's RESERVED_PREFIXES (src/mcp_handlers/validators.py). An
+# agent_id with one of these prefixes is rejected by get_governance_metrics with
+# error_type=reserved_prefix. list_agents redacts UUIDs for non-operator callers
+# and can hand back a synthesized reserved-prefix human id (e.g. Chronicler's
+# "mcp_<date>_<suffix>"); round-tripping that into a metrics read produces a
+# guaranteed rejection every HUD cycle (~2/min). Skip such ids before firing.
+_RESERVED_AGENT_ID_PREFIXES = (
+    "system_", "admin_", "root_", "mcp_", "governance_", "auth_",
+)
+
+
+def _is_reserved_agent_id(agent_id: str) -> bool:
+    return agent_id.lower().startswith(_RESERVED_AGENT_ID_PREFIXES)
+
 
 class GovernanceClient:
     """Client for the governance-mcp HTTP API.
@@ -306,6 +320,14 @@ async def fetch_metrics(
             # Defense in depth: even if fetch_agents emitted an empty id
             # (shouldn't happen post-fix), don't fire metric requests for
             # "" — they return empty dicts and pollute the HUD.
+            continue
+        if _is_reserved_agent_id(agent_id):
+            # Reserved-prefix ids (e.g. a redacted "mcp_<date>_<suffix>" human
+            # id from list_agents) are rejected by get_governance_metrics with
+            # error_type=reserved_prefix. Firing them anyway logs a guaranteed
+            # failure every HUD cycle. The agent still shows in the HUD with its
+            # label; it just carries no EISV — same outcome as today, minus the
+            # rejected call.
             continue
         result = await gov_client.call_tool(
             "get_governance_metrics", {"agent_id": agent_id},
