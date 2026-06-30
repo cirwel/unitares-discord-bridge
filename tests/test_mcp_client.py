@@ -255,6 +255,37 @@ async def test_fallback_client_closed_after_use():
         mock_cls.return_value.aclose.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_governance_record_bridge_event_posts_receipt():
+    resp = make_mock_response(json_data={"success": True})
+    with mock_httpx_client("post", resp) as mock_cls:
+        client = GovernanceClient("http://localhost:8767")
+        client.agent_uuid = "bridge-uuid"
+        result = await client.record_bridge_event({
+            "event_type": "bridge.delivery",
+            "source_event_id": 1,
+        })
+
+    assert result is True
+    posted = mock_cls.return_value.post.await_args
+    assert posted.args[0] == "/v1/bridge/events"
+    assert posted.kwargs["json"]["bridge_id"] == "bridge-uuid"
+    assert posted.kwargs["json"]["source_event_id"] == 1
+    mock_cls.return_value.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_governance_record_bridge_event_is_best_effort():
+    with mock_httpx_client_error("post", Exception("server old")):
+        client = GovernanceClient("http://localhost:8767")
+        result = await client.record_bridge_event({
+            "event_type": "bridge.delivery",
+            "source_event_id": 1,
+        })
+
+    assert result is False
+
+
 # --- Token auth tests ---
 
 @pytest.mark.asyncio
