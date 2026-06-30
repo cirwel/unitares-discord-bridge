@@ -29,6 +29,7 @@ def _make_poller(
         gov.fetch_events = AsyncMock(return_value=events)
     else:
         gov.fetch_events = AsyncMock(side_effect=[events, probe_events])
+    gov.record_bridge_event = AsyncMock(return_value=True)
     gov.consecutive_failures = 0
 
     cache = MagicMock()
@@ -50,7 +51,7 @@ def _make_poller(
     routed: list[tuple[str, discord.Embed]] = []
 
     async def capture_put(item):
-        channel, embed = item
+        channel, embed, _source_event = item
         routed.append((channel.name, embed))
 
     poller._message_queue.put = capture_put
@@ -186,6 +187,26 @@ async def test_non_int_event_id_is_skipped_entirely():
     await poller._poll_loop_once()
     assert routed == []
     poller.cache.set_event_cursor.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_suppressed_event_records_bridge_receipt(monkeypatch):
+    from bridge import config
+
+    monkeypatch.setattr(config, "SUPPRESSED_EVENT_TYPES", {"knowledge_read"})
+    poller, routed = _make_poller(
+        [{"event_id": 1, "type": "knowledge_read", "severity": "info",
+          "message": "m", "agent_id": "a", "agent_name": "A"}],
+    )
+
+    await poller._poll_loop_once()
+
+    assert routed == []
+    poller.gov.record_bridge_event.assert_awaited_once()
+    payload = poller.gov.record_bridge_event.await_args.args[0]
+    assert payload["event_type"] == "bridge.suppressed"
+    assert payload["source_event_id"] == 1
+    assert payload["reason"] == "suppressed_event_type"
 
 
 @pytest.mark.asyncio

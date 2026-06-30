@@ -169,6 +169,7 @@ async def on_ready():
             class_channels=class_channels,
             taxonomy_reverse=(taxonomy or {}).get("reverse") or {},
             lease_plane_phase_b_channel=phase_b_ch,
+            gov_client=gov_client,
         )
         await ws_subscriber.start()
         log.info(

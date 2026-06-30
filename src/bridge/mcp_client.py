@@ -130,6 +130,29 @@ class GovernanceClient:
             if self._client is None:
                 await client.aclose()
 
+    async def record_bridge_event(self, payload: dict) -> bool:
+        """POST a Discord delivery/attention receipt to governance.
+
+        Receipt writes are best-effort observability. A failure here must not
+        affect governance polling or Discord delivery.
+        """
+        client = self._get_client()
+        enriched = {
+            **payload,
+            "bridge_id": self.agent_uuid or payload.get("bridge_id") or "discord-bridge",
+        }
+        try:
+            resp = await client.post("/v1/bridge/events", json=enriched, timeout=5)
+            resp.raise_for_status()
+            data = resp.json()
+            return bool(data.get("success"))
+        except Exception as exc:
+            log.debug("governance bridge receipt failed: %s", exc)
+            return False
+        finally:
+            if self._client is None:
+                await client.aclose()
+
     async def onboard(self, identity_path: str) -> bool:
         """Mint a governance identity for this bridge process-instance.
 

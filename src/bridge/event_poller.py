@@ -43,7 +43,7 @@ class EventPoller:
         self._task: asyncio.Task | None = None
         self._send_task: asyncio.Task | None = None
         self._gov_alert_sent: bool = False
-        self._message_queue: asyncio.Queue[tuple[discord.TextChannel, discord.Embed]] = (
+        self._message_queue: asyncio.Queue[tuple[discord.TextChannel, discord.Embed, dict | None]] = (
             asyncio.Queue(maxsize=100)
         )
 
@@ -121,6 +121,11 @@ class EventPoller:
                 # before posting. The cursor still advances over them below, so
                 # they're skipped, not re-fetched.
                 if event.get("type") in config.SUPPRESSED_EVENT_TYPES:
+                    await self._record_receipt(
+                        "bridge.suppressed",
+                        source_event=event,
+                        reason="suppressed_event_type",
+                    )
                     continue
                 # Per-event try/except: a single malformed event (e.g. a
                 # drift_alert with value=null that used to crash the embed
@@ -131,21 +136,27 @@ class EventPoller:
                     embed = event_to_embed(event)
                     is_finding = event.get("type", "").endswith("_finding")
                     if is_finding and self.residents_channel is not None:
-                        await self._message_queue.put((self.residents_channel, embed))
+                        await self._message_queue.put((self.residents_channel, embed, event))
                     else:
                         bucket = classify_rest_event(event)
                         target = (
                             self.activity_channel if bucket == "activity"
                             else self.signals_channel
                         )
-                        await self._message_queue.put((target, embed))
+                        await self._message_queue.put((target, embed, event))
                     if is_critical_event(event):
-                        await self._message_queue.put((self.alerts_channel, embed))
+                        await self._message_queue.put((self.alerts_channel, embed, event))
                 except Exception as exc:
                     log.error(
                         "Failed to dispatch event %s (type=%s): %s",
                         event.get("event_id"), event.get("type"), exc,
                         exc_info=exc,
+                    )
+                    await self._record_receipt(
+                        "bridge.delivery_failed",
+                        source_event=event,
+                        reason="embed_dispatch_failed",
+                        error=str(exc),
                     )
             if events:
                 # Advance past every fetched event — including ones that failed
@@ -159,38 +170,116 @@ class EventPoller:
                     title="Governance MCP Unreachable",
                     colour=discord.Colour.dark_red(),
                 )
-                await self._message_queue.put((self.alerts_channel, warn))
+                await self._message_queue.put((self.alerts_channel, warn, None))
             elif self.gov.consecutive_failures == 0 and self._gov_alert_sent:
                 self._gov_alert_sent = False
                 recovered = discord.Embed(
                     title="Governance MCP Recovered",
                     colour=discord.Colour.green(),
                 )
-                await self._message_queue.put((self.alerts_channel, recovered))
+                await self._message_queue.put((self.alerts_channel, recovered, None))
         except Exception as exc:
             log.error("Event poll error: %s", exc, exc_info=exc)
 
+    def _receipt_payload(
+        self,
+        event_type: str,
+        source_event: dict,
+        channel: discord.TextChannel | None = None,
+        *,
+        discord_message_id: int | str | None = None,
+        reason: str | None = None,
+        error: str | None = None,
+    ) -> dict:
+        payload = {
+            "event_type": event_type,
+            "source_event_id": source_event.get("event_id"),
+            "source_event_type": source_event.get("type"),
+            "source_agent_id": source_event.get("agent_id"),
+            "source_severity": source_event.get("severity", "info"),
+        }
+        if channel is not None:
+            payload.update({
+                "channel_key": getattr(channel, "name", None),
+                "discord_channel_id": str(getattr(channel, "id", "")),
+            })
+        if discord_message_id is not None:
+            payload["discord_message_id"] = str(discord_message_id)
+        if reason:
+            payload["reason"] = reason
+        if error:
+            payload["error"] = error
+        return payload
+
+    async def _record_receipt(
+        self,
+        event_type: str,
+        *,
+        source_event: dict | None,
+        channel: discord.TextChannel | None = None,
+        discord_message_id: int | str | None = None,
+        reason: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        if not source_event:
+            return
+        await self.gov.record_bridge_event(
+            self._receipt_payload(
+                event_type,
+                source_event,
+                channel,
+                discord_message_id=discord_message_id,
+                reason=reason,
+                error=error,
+            )
+        )
+
     async def _send_loop(self) -> None:
         while True:
-            channel, embed = await self._message_queue.get()
+            channel, embed, source_event = await self._message_queue.get()
             try:
-                await channel.send(embed=embed)
+                message = await channel.send(embed=embed)
+                await self._record_receipt(
+                    "bridge.delivery",
+                    source_event=source_event,
+                    channel=channel,
+                    discord_message_id=getattr(message, "id", None),
+                )
             except discord.RateLimited as exc:
                 # Raised when max_ratelimit_timeout is set and the retry-after exceeds it.
                 # Respect Discord's back-off and re-queue rather than dropping the message.
                 log.warning("Global rate limit hit; retrying in %.1fs", exc.retry_after)
+                await self._record_receipt(
+                    "bridge.rate_limited",
+                    source_event=source_event,
+                    channel=channel,
+                    reason="discord_rate_limited",
+                )
                 await asyncio.sleep(exc.retry_after)
-                await self._message_queue.put((channel, embed))
+                await self._message_queue.put((channel, embed, source_event))
             except discord.HTTPException as exc:
                 if exc.status == 429:
                     # Per-route 429 that discord.py's internal limiter did not absorb.
                     # Parse Retry-After from the response headers, fall back to 5 s.
                     retry_after = float(exc.response.headers.get("Retry-After", 5))
                     log.warning("Rate limited (HTTP 429); retrying in %.1fs", retry_after)
+                    await self._record_receipt(
+                        "bridge.rate_limited",
+                        source_event=source_event,
+                        channel=channel,
+                        reason="discord_http_429",
+                    )
                     await asyncio.sleep(retry_after)
-                    await self._message_queue.put((channel, embed))
+                    await self._message_queue.put((channel, embed, source_event))
                 else:
                     log.warning("Discord send failed: %s", exc)
+                    await self._record_receipt(
+                        "bridge.delivery_failed",
+                        source_event=source_event,
+                        channel=channel,
+                        reason="discord_http_exception",
+                        error=str(exc),
+                    )
             # 150 ms pacing between sends to stay well under Discord's per-route burst
             # limit — this is not a retry delay; rate limit retries are handled above.
             await asyncio.sleep(0.15)
