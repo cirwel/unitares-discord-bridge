@@ -32,12 +32,19 @@ def _event_description(event: dict) -> str:
 
 
 def _event_agent(event: dict) -> str:
-    agent_id = event.get("agent_id")
-    return (
-        event.get("agent_name")
+    agent_id = event.get("resident_id") or event.get("agent_id")
+    short_id = str(agent_id)[:12] if agent_id else ""
+    name = (
+        event.get("resident_name")
+        or event.get("resident_label")
+        or event.get("agent_name")
         or event.get("agent_label")
-        or (str(agent_id)[:12] if agent_id else "system")
     )
+    if name and short_id and str(name) not in (str(agent_id), short_id):
+        return f"{name} ({short_id})"
+    if name:
+        return str(name)
+    return short_id or "system"
 
 
 def _safe_float(value, default: float = 0.0) -> float:

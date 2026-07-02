@@ -12,10 +12,34 @@ import discord
 from bridge import config
 from bridge.cache import BridgeCache
 from bridge.embeds import classify_rest_event, event_to_embed, is_critical_event
-from bridge.mcp_client import GovernanceClient
+from bridge.mcp_client import GovernanceClient, fetch_agents
 from bridge.tasks import cancel_tasks, create_logged_task
 
 log = logging.getLogger(__name__)
+
+_RESIDENT_NAME_KEYS = (
+    "resident_name",
+    "resident_label",
+    "agent_name",
+    "agent_label",
+)
+
+
+def _needs_resident_label(event: dict) -> bool:
+    return bool(
+        (event.get("resident_id") or event.get("agent_id"))
+        and not any(event.get(key) for key in _RESIDENT_NAME_KEYS)
+    )
+
+
+def _with_resident_label(event: dict, label_by_id: dict[str, str]) -> dict:
+    agent_id = event.get("resident_id") or event.get("agent_id")
+    if not agent_id or not _needs_resident_label(event):
+        return event
+    label = label_by_id.get(str(agent_id))
+    if not label:
+        return event
+    return {**event, "agent_label": label}
 
 
 class EventPoller:
@@ -116,6 +140,16 @@ class EventPoller:
                     )
                     await self.cache.set_event_cursor(0)
                     return
+            label_by_id: dict[str, str] = {}
+            if any(_needs_resident_label(event) for event in events):
+                try:
+                    label_by_id = {
+                        str(agent["id"]): str(agent["label"])
+                        for agent in await fetch_agents(self.gov)
+                        if agent.get("id") and agent.get("label")
+                    }
+                except Exception as exc:
+                    log.warning("Failed to resolve resident labels for events: %s", exc)
             for event in events:
                 # Drop suppressed (noisy) event types — e.g. knowledge_read —
                 # before posting. The cursor still advances over them below, so
@@ -133,7 +167,8 @@ class EventPoller:
                 # — otherwise the next poll fetches the same poisoned batch
                 # and the feed stays silent forever.
                 try:
-                    embed = event_to_embed(event)
+                    event_for_embed = _with_resident_label(event, label_by_id)
+                    embed = event_to_embed(event_for_embed)
                     is_finding = event.get("type", "").endswith("_finding")
                     if is_finding and self.residents_channel is not None:
                         await self._message_queue.put((self.residents_channel, embed, event))
