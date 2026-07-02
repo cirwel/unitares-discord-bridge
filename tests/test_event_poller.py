@@ -286,3 +286,28 @@ async def test_mixed_event_ids_renders_int_only_and_advances_cursor():
     channels_hit = [name for name, _ in routed]
     assert channels_hit == ["activity"]
     poller.cache.set_event_cursor.assert_awaited_once_with(3)
+
+
+@pytest.mark.asyncio
+async def test_id_only_signal_is_enriched_with_resident_label():
+    poller, routed = _make_poller(
+        [{"event_id": 1, "type": "coherence_drop", "severity": "warning",
+          "message": "m",
+          "agent_id": "fe5975a6-23c7-4e55-9a9d-9c4bdb9b45a7"}],
+    )
+    poller.gov.call_tool = AsyncMock(return_value={
+        "result": {
+            "agents": [
+                {
+                    "agent_id": "fe5975a6-23c7-4e55-9a9d-9c4bdb9b45a7",
+                    "label": "opus_hikewa",
+                },
+            ],
+        },
+    })
+
+    await poller._poll_loop_once()
+
+    assert routed[0][0] == "signals"
+    assert routed[0][1].fields[0].name == "Agent"
+    assert routed[0][1].fields[0].value == "opus_hikewa (fe5975a6-23c)"

@@ -232,14 +232,14 @@ def test_agent_field_prefers_label_then_name_then_id():
         "agent_name": "gpt",
         "agent_id": "abc-def",
     })
-    assert any(f.value == "opus" for f in e1.fields)
+    assert any(f.value == "opus (abc-def)" for f in e1.fields)
 
     e2 = broadcaster_event_to_embed({
         "type": "lifecycle_paused",
         "agent_name": "gpt",
         "agent_id": "abc-def",
     })
-    assert any(f.value == "gpt" for f in e2.fields)
+    assert any(f.value == "gpt (abc-def)" for f in e2.fields)
 
     e3 = broadcaster_event_to_embed({
         "type": "lifecycle_paused",

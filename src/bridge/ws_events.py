@@ -117,12 +117,20 @@ def broadcaster_event_to_embed(event: dict) -> Optional[discord.Embed]:
     if not t or t == "eisv_update":
         return None
 
-    agent_id = event.get("agent_id") or ""
-    agent = (
-        event.get("agent_label")
+    agent_id = event.get("resident_id") or event.get("agent_id") or ""
+    short_id = str(agent_id)[:12] if agent_id else ""
+    agent_name = (
+        event.get("resident_name")
+        or event.get("resident_label")
+        or event.get("agent_label")
         or event.get("agent_name")
-        or (str(agent_id)[:12] if agent_id else "system")
     )
+    if agent_name and short_id and str(agent_name) not in (str(agent_id), short_id):
+        agent = f"{agent_name} ({short_id})"
+    elif agent_name:
+        agent = str(agent_name)
+    else:
+        agent = short_id or "system"
     ts = event.get("timestamp")
 
     title = t.replace("_", " ")
