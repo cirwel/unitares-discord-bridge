@@ -29,6 +29,7 @@ def _make_poller(
         gov.fetch_events = AsyncMock(return_value=events)
     else:
         gov.fetch_events = AsyncMock(side_effect=[events, probe_events])
+    gov.record_bridge_event = AsyncMock(return_value=True)
     gov.consecutive_failures = 0
 
     cache = MagicMock()
@@ -50,7 +51,7 @@ def _make_poller(
     routed: list[tuple[str, discord.Embed]] = []
 
     async def capture_put(item):
-        channel, embed = item
+        channel, embed, _source_event = item
         routed.append((channel.name, embed))
 
     poller._message_queue.put = capture_put
@@ -189,6 +190,26 @@ async def test_non_int_event_id_is_skipped_entirely():
 
 
 @pytest.mark.asyncio
+async def test_suppressed_event_records_bridge_receipt(monkeypatch):
+    from bridge import config
+
+    monkeypatch.setattr(config, "SUPPRESSED_EVENT_TYPES", {"knowledge_read"})
+    poller, routed = _make_poller(
+        [{"event_id": 1, "type": "knowledge_read", "severity": "info",
+          "message": "m", "agent_id": "a", "agent_name": "A"}],
+    )
+
+    await poller._poll_loop_once()
+
+    assert routed == []
+    poller.gov.record_bridge_event.assert_awaited_once()
+    payload = poller.gov.record_bridge_event.await_args.args[0]
+    assert payload["event_type"] == "bridge.suppressed"
+    assert payload["source_event_id"] == 1
+    assert payload["reason"] == "suppressed_event_type"
+
+
+@pytest.mark.asyncio
 async def test_stale_cursor_resets_when_server_counter_regressed():
     # Simulates governance MCP restart: our cached cursor is 45 but the
     # server's in-memory int counter is back at 1, so every `since=45` poll
@@ -286,6 +307,45 @@ async def test_mixed_event_ids_renders_int_only_and_advances_cursor():
     channels_hit = [name for name, _ in routed]
     assert channels_hit == ["activity"]
     poller.cache.set_event_cursor.assert_awaited_once_with(3)
+
+
+def test_write_heartbeat_touches_file(tmp_path, monkeypatch):
+    """The liveness heartbeat is written with a parseable, fresh timestamp."""
+    import os
+    import time
+    from datetime import datetime
+
+    from bridge import config
+
+    hb = tmp_path / "sub" / "heartbeat"  # nested dir must be created
+    monkeypatch.setattr(config, "BRIDGE_HEARTBEAT_PATH", str(hb))
+
+    poller, _ = _make_poller([])
+    poller._write_heartbeat()
+
+    assert hb.exists()
+    # content parses as an ISO-8601 instant, and the file is fresh.
+    datetime.fromisoformat(hb.read_text())
+    assert time.time() - os.path.getmtime(hb) < 5
+
+
+def test_write_heartbeat_is_best_effort(monkeypatch):
+    """A heartbeat write failure must never propagate out of the poll loop."""
+    from bridge import config
+
+    # An unwritable path (root of a non-existent device-ish path) must be swallowed.
+    monkeypatch.setattr(config, "BRIDGE_HEARTBEAT_PATH", "/proc/nonexistent/heartbeat")
+    poller, _ = _make_poller([])
+    poller._write_heartbeat()  # must not raise
+
+
+def test_write_heartbeat_disabled_when_path_empty(monkeypatch):
+    """Empty BRIDGE_HEARTBEAT_PATH disables the write (no error)."""
+    from bridge import config
+
+    monkeypatch.setattr(config, "BRIDGE_HEARTBEAT_PATH", "")
+    poller, _ = _make_poller([])
+    poller._write_heartbeat()  # no-op, must not raise
 
 
 @pytest.mark.asyncio

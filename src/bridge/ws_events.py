@@ -33,6 +33,7 @@ import websockets
 import websockets.exceptions
 
 from bridge import config
+from bridge.mcp_client import GovernanceClient
 
 from bridge.tasks import cancel_tasks, create_logged_task
 
@@ -291,8 +292,10 @@ class WSEventSubscriber:
         class_channels: Optional[dict[str, discord.TextChannel]] = None,
         taxonomy_reverse: Optional[dict] = None,
         lease_plane_phase_b_channel: Optional[discord.TextChannel] = None,
+        gov_client: Optional[GovernanceClient] = None,
     ) -> None:
         self.ws_url = ws_url_from_http(governance_url)
+        self.gov = gov_client
         self.activity_channel = activity_channel
         self.signals_channel = signals_channel
         self.alerts_channel = alerts_channel
@@ -316,7 +319,7 @@ class WSEventSubscriber:
         self._sub_task: Optional[asyncio.Task] = None
         self._send_task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
-        self._send_queue: asyncio.Queue[tuple[discord.TextChannel, discord.Embed]] = (
+        self._send_queue: asyncio.Queue[tuple[discord.TextChannel, discord.Embed, dict | None]] = (
             asyncio.Queue(maxsize=_SEND_QUEUE_MAX)
         )
 
@@ -387,6 +390,11 @@ class WSEventSubscriber:
         # /digest aggregation but NOT posted to Discord. This is the WS twin of
         # the REST poller's filter; knowledge_read arrives via this path.
         if event.get("type") in config.SUPPRESSED_EVENT_TYPES:
+            await self._record_receipt(
+                "bridge.suppressed",
+                source_event=event,
+                reason="suppressed_event_type",
+            )
             return
         embed = broadcaster_event_to_embed(event)
         if embed is None:
@@ -394,19 +402,30 @@ class WSEventSubscriber:
         bucket = classify_broadcaster_event(event)
         target = self.activity_channel if bucket == "activity" else self.signals_channel
         try:
-            self._send_queue.put_nowait((target, embed))
+            self._send_queue.put_nowait((target, embed, event))
         except asyncio.QueueFull:
             # Drop rather than block the websocket reader. The dashboard
             # is the authoritative event record anyway; Discord is a
             # human-facing surface with rate limits.
             log.warning("WS events: send queue full, dropping event %s",
                         event.get("type"))
+            await self._record_receipt(
+                "bridge.delivery_failed",
+                source_event=event,
+                channel=target,
+                reason="send_queue_full",
+            )
             return
         if is_critical_broadcaster_event(event):
             try:
-                self._send_queue.put_nowait((self.alerts_channel, embed))
+                self._send_queue.put_nowait((self.alerts_channel, embed, event))
             except asyncio.QueueFull:
-                pass
+                await self._record_receipt(
+                    "bridge.delivery_failed",
+                    source_event=event,
+                    channel=self.alerts_channel,
+                    reason="send_queue_full",
+                )
         # Per-class mirror: when an event maps to a violation class and the
         # bridge has a channel for it, post there too. This is the core value
         # of class routing — operators can subscribe to a subset of classes
@@ -416,9 +435,14 @@ class WSEventSubscriber:
             cls_channel = self.class_channels.get(class_id)
             if cls_channel is not None:
                 try:
-                    self._send_queue.put_nowait((cls_channel, embed))
+                    self._send_queue.put_nowait((cls_channel, embed, event))
                 except asyncio.QueueFull:
-                    pass
+                    await self._record_receipt(
+                        "bridge.delivery_failed",
+                        source_event=event,
+                        channel=cls_channel,
+                        reason="send_queue_full",
+                    )
 
         # Lease-plane Phase B transition mirror: a dedicated channel for the
         # narrow stream of "criterion N flipped" / "PROMOTABLE" / "REGRESSED"
@@ -431,37 +455,130 @@ class WSEventSubscriber:
         ):
             try:
                 self._send_queue.put_nowait(
-                    (self.lease_plane_phase_b_channel, embed)
+                    (self.lease_plane_phase_b_channel, embed, event)
                 )
             except asyncio.QueueFull:
-                pass
+                await self._record_receipt(
+                    "bridge.delivery_failed",
+                    source_event=event,
+                    channel=self.lease_plane_phase_b_channel,
+                    reason="send_queue_full",
+                )
+
+    def _receipt_payload(
+        self,
+        event_type: str,
+        source_event: dict,
+        channel: discord.TextChannel | None = None,
+        *,
+        discord_message_id: int | str | None = None,
+        reason: str | None = None,
+        error: str | None = None,
+    ) -> dict:
+        payload = {
+            "event_type": event_type,
+            "source_event_id": source_event.get("event_id"),
+            "source_event_type": source_event.get("type"),
+            "source_agent_id": source_event.get("agent_id"),
+            "source_severity": source_event.get("severity", "info"),
+        }
+        if channel is not None:
+            payload.update({
+                "channel_key": getattr(channel, "name", None),
+                "discord_channel_id": str(getattr(channel, "id", "")),
+            })
+        if discord_message_id is not None:
+            payload["discord_message_id"] = str(discord_message_id)
+        if reason:
+            payload["reason"] = reason
+        if error:
+            payload["error"] = error
+        return payload
+
+    async def _record_receipt(
+        self,
+        event_type: str,
+        *,
+        source_event: dict | None,
+        channel: discord.TextChannel | None = None,
+        discord_message_id: int | str | None = None,
+        reason: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        if not self.gov or not source_event:
+            return
+        await self.gov.record_bridge_event(
+            self._receipt_payload(
+                event_type,
+                source_event,
+                channel,
+                discord_message_id=discord_message_id,
+                reason=reason,
+                error=error,
+            )
+        )
 
     async def _send_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
-                channel, embed = await self._send_queue.get()
+                channel, embed, source_event = await self._send_queue.get()
             except asyncio.CancelledError:
                 raise
             try:
-                await channel.send(embed=embed)
+                message = await channel.send(embed=embed)
+                await self._record_receipt(
+                    "bridge.delivery",
+                    source_event=source_event,
+                    channel=channel,
+                    discord_message_id=getattr(message, "id", None),
+                )
             except discord.RateLimited as exc:
                 log.warning("WS events: rate limited, retry in %.1fs",
                             exc.retry_after)
+                await self._record_receipt(
+                    "bridge.rate_limited",
+                    source_event=source_event,
+                    channel=channel,
+                    reason="discord_rate_limited",
+                )
                 await asyncio.sleep(exc.retry_after)
                 try:
-                    self._send_queue.put_nowait((channel, embed))
+                    self._send_queue.put_nowait((channel, embed, source_event))
                 except asyncio.QueueFull:
-                    pass
+                    await self._record_receipt(
+                        "bridge.delivery_failed",
+                        source_event=source_event,
+                        channel=channel,
+                        reason="send_queue_full",
+                    )
             except discord.HTTPException as exc:
                 if exc.status == 429:
                     retry = float(exc.response.headers.get("Retry-After", 5))
+                    await self._record_receipt(
+                        "bridge.rate_limited",
+                        source_event=source_event,
+                        channel=channel,
+                        reason="discord_http_429",
+                    )
                     await asyncio.sleep(retry)
                     try:
-                        self._send_queue.put_nowait((channel, embed))
+                        self._send_queue.put_nowait((channel, embed, source_event))
                     except asyncio.QueueFull:
-                        pass
+                        await self._record_receipt(
+                            "bridge.delivery_failed",
+                            source_event=source_event,
+                            channel=channel,
+                            reason="send_queue_full",
+                        )
                 else:
                     log.warning("WS events: discord send failed (%s)", exc)
+                    await self._record_receipt(
+                        "bridge.delivery_failed",
+                        source_event=source_event,
+                        channel=channel,
+                        reason="discord_http_exception",
+                        error=str(exc),
+                    )
             # 150 ms pacing between sends — matches event_poller to stay
             # well under Discord's per-route burst limits.
             await asyncio.sleep(0.15)

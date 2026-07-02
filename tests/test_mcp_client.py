@@ -255,6 +255,37 @@ async def test_fallback_client_closed_after_use():
         mock_cls.return_value.aclose.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_governance_record_bridge_event_posts_receipt():
+    resp = make_mock_response(json_data={"success": True})
+    with mock_httpx_client("post", resp) as mock_cls:
+        client = GovernanceClient("http://localhost:8767")
+        client.agent_uuid = "bridge-uuid"
+        result = await client.record_bridge_event({
+            "event_type": "bridge.delivery",
+            "source_event_id": 1,
+        })
+
+    assert result is True
+    posted = mock_cls.return_value.post.await_args
+    assert posted.args[0] == "/v1/bridge/events"
+    assert posted.kwargs["json"]["bridge_id"] == "bridge-uuid"
+    assert posted.kwargs["json"]["source_event_id"] == 1
+    mock_cls.return_value.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_governance_record_bridge_event_is_best_effort():
+    with mock_httpx_client_error("post", Exception("server old")):
+        client = GovernanceClient("http://localhost:8767")
+        result = await client.record_bridge_event({
+            "event_type": "bridge.delivery",
+            "source_event_id": 1,
+        })
+
+    assert result is False
+
+
 # --- Token auth tests ---
 
 @pytest.mark.asyncio
@@ -401,6 +432,35 @@ async def test_fetch_metrics_does_not_query_for_empty_id():
     assert args[1]["agent_id"] == "uuid-a"
     assert "uuid-a" in metrics
     assert "" not in metrics
+
+
+@pytest.mark.asyncio
+async def test_fetch_metrics_skips_reserved_prefix_ids():
+    """A redacted reserved-prefix id (e.g. Chronicler's "mcp_<date>_<suffix>")
+    is rejected by get_governance_metrics; skip it instead of firing a
+    guaranteed reserved_prefix failure every HUD cycle.
+    """
+    from bridge.mcp_client import fetch_metrics
+
+    gov = AsyncMock()
+    gov.call_tool.return_value = {"result": {"E": 0.5, "I": 0.5, "S": 0.5, "V": 0.0}}
+
+    metrics = await fetch_metrics(
+        gov,
+        [
+            {"id": "mcp_20260423_deb879b6"},
+            {"id": "governance_resident"},
+            {"id": "uuid-a"},
+        ],
+    )
+
+    # Only the non-reserved id is queried.
+    assert gov.call_tool.await_count == 1
+    args, kwargs = gov.call_tool.await_args
+    assert args[1]["agent_id"] == "uuid-a"
+    assert "uuid-a" in metrics
+    assert "mcp_20260423_deb879b6" not in metrics
+    assert "governance_resident" not in metrics
 
 
 # --- onboard / identity binding tests ---
