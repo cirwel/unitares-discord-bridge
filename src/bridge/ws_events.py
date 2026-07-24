@@ -322,6 +322,44 @@ class WSEventSubscriber:
         self._send_queue: asyncio.Queue[tuple[discord.TextChannel, discord.Embed, dict | None]] = (
             asyncio.Queue(maxsize=_SEND_QUEUE_MAX)
         )
+        # (event_type, agent_id) -> (monotonic ts of last post, metric value)
+        # for repeat-drift suppression; see _suppress_repeat_drift().
+        self._drift_last: dict[tuple[str, str], tuple[float, Optional[float]]] = {}
+
+    def _suppress_repeat_drift(self, event: dict) -> bool:
+        """True when a drift event repeats a recently-posted one for its agent.
+
+        identity_drift / trajectory_drift are emitted on every check-in while
+        the underlying condition is static, so an unchanged metric would post
+        hundreds of identical embeds a day (unitares#1370). Post when the
+        metric moved more than DRIFT_REPEAT_DELTA or the re-reminder window
+        elapsed; suppress the static repeats in between.
+        """
+        if config.DRIFT_REPEAT_WINDOW_SECONDS <= 0:
+            return False
+        t = event.get("type") or ""
+        if t not in config.DRIFT_REPEAT_TYPES:
+            return False
+        key = (t, str(event.get("agent_id") or event.get("resident_id") or ""))
+        raw = event.get("lineage_similarity")
+        try:
+            value: Optional[float] = float(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            value = None
+        now = time.monotonic()
+        prev = self._drift_last.get(key)
+        if prev is not None:
+            prev_ts, prev_value = prev
+            within_window = (now - prev_ts) < config.DRIFT_REPEAT_WINDOW_SECONDS
+            unchanged = (value is None and prev_value is None) or (
+                value is not None
+                and prev_value is not None
+                and abs(value - prev_value) <= config.DRIFT_REPEAT_DELTA
+            )
+            if within_window and unchanged:
+                return True
+        self._drift_last[key] = (now, value)
+        return False
 
     async def start(self) -> None:
         self._stop_event.clear()
@@ -394,6 +432,16 @@ class WSEventSubscriber:
                 "bridge.suppressed",
                 source_event=event,
                 reason="suppressed_event_type",
+            )
+            return
+        # Static drift conditions re-fire per check-in; only posts when the
+        # metric moves or the re-reminder window lapses (recorded above for
+        # /digest either way).
+        if self._suppress_repeat_drift(event):
+            await self._record_receipt(
+                "bridge.suppressed",
+                source_event=event,
+                reason="repeat_drift",
             )
             return
         embed = broadcaster_event_to_embed(event)
