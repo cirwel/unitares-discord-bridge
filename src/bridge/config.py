@@ -38,6 +38,25 @@ SUPPRESSED_EVENT_TYPES = {
     if t.strip()
 }
 
+# Repeat-drift suppression — identity_drift / trajectory_drift re-fire on every
+# check-in while the underlying condition is static (unitares#1370: a client
+# cutover held lineage_similarity flat at 0.12 and produced 300+ identical
+# embeds/day). The first event posts; repeats for the same (type, agent) are
+# suppressed until the metric moves more than BRIDGE_DRIFT_REPEAT_DELTA or the
+# window elapses (periodic re-reminder). Suppressed events still reach the
+# ring buffer for /digest. Set BRIDGE_DRIFT_REPEAT_WINDOW_SECONDS=0 to disable.
+DRIFT_REPEAT_WINDOW_SECONDS = float(
+    os.environ.get("BRIDGE_DRIFT_REPEAT_WINDOW_SECONDS", "21600")
+)
+DRIFT_REPEAT_DELTA = float(os.environ.get("BRIDGE_DRIFT_REPEAT_DELTA", "0.05"))
+DRIFT_REPEAT_TYPES = {
+    t.strip()
+    for t in os.environ.get(
+        "BRIDGE_DRIFT_REPEAT_TYPES", "identity_drift,trajectory_drift"
+    ).split(",")
+    if t.strip()
+}
+
 # Per-class routing — when enabled, broadcaster events that map to a
 # violation class (via /v1/taxonomy reverse-lookup) are mirrored to a
 # class-specific text channel in addition to the main #events channel.

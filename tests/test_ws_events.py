@@ -448,3 +448,70 @@ def test_phase_b_classified_as_signals():
         classify_broadcaster_event({"type": "lease_plane_phase_b_transition"})
         == "signals"
     )
+
+
+# ---------------------------------------------------------------------------
+# repeat-drift suppression (_suppress_repeat_drift)
+# ---------------------------------------------------------------------------
+
+
+def _bare_subscriber():
+    """WSEventSubscriber without __init__ — the helper only touches
+    _drift_last and config, so we skip the Discord-channel plumbing the
+    module docstring warns about."""
+    from bridge.ws_events import WSEventSubscriber
+
+    sub = WSEventSubscriber.__new__(WSEventSubscriber)
+    sub._drift_last = {}
+    return sub
+
+
+def _drift(agent="69a1a4f7", sim=0.123, etype="identity_drift"):
+    return {"type": etype, "agent_id": agent, "lineage_similarity": sim}
+
+
+def test_repeat_drift_first_posts_then_suppresses():
+    sub = _bare_subscriber()
+    assert sub._suppress_repeat_drift(_drift()) is False
+    assert sub._suppress_repeat_drift(_drift()) is True
+    assert sub._suppress_repeat_drift(_drift(sim=0.124)) is True  # within delta
+
+
+def test_repeat_drift_posts_when_metric_moves():
+    sub = _bare_subscriber()
+    assert sub._suppress_repeat_drift(_drift(sim=0.12)) is False
+    assert sub._suppress_repeat_drift(_drift(sim=0.55)) is False  # > delta
+
+
+def test_repeat_drift_reposts_after_window(monkeypatch):
+    sub = _bare_subscriber()
+    assert sub._suppress_repeat_drift(_drift()) is False
+    # Age the stored timestamp past the window instead of sleeping.
+    (key, (ts, val)), = sub._drift_last.items()
+    from bridge import config
+
+    sub._drift_last[key] = (ts - config.DRIFT_REPEAT_WINDOW_SECONDS - 1, val)
+    assert sub._suppress_repeat_drift(_drift()) is False
+
+
+def test_repeat_drift_agents_tracked_independently():
+    sub = _bare_subscriber()
+    assert sub._suppress_repeat_drift(_drift(agent="a")) is False
+    assert sub._suppress_repeat_drift(_drift(agent="b")) is False
+    assert sub._suppress_repeat_drift(_drift(agent="a")) is True
+
+
+def test_repeat_drift_ignores_other_event_types():
+    sub = _bare_subscriber()
+    assert sub._suppress_repeat_drift({"type": "lifecycle_paused", "agent_id": "a"}) is False
+    assert sub._suppress_repeat_drift({"type": "lifecycle_paused", "agent_id": "a"}) is False
+    assert sub._drift_last == {}
+
+
+def test_repeat_drift_disabled_by_zero_window(monkeypatch):
+    from bridge import config
+
+    monkeypatch.setattr(config, "DRIFT_REPEAT_WINDOW_SECONDS", 0)
+    sub = _bare_subscriber()
+    assert sub._suppress_repeat_drift(_drift()) is False
+    assert sub._suppress_repeat_drift(_drift()) is False
