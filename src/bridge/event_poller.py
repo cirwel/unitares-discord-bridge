@@ -105,6 +105,13 @@ class EventPoller:
         try:
             cursor = await self.cache.get_event_cursor()
             events = await self.gov.fetch_events(since=cursor)
+            if events is None:
+                # Transient governance failure — wait for the next poll. Do NOT
+                # fall through to the stale-cursor probe: during a governance
+                # stall the probe fails too, and treating that as "server max
+                # 0" reset the cursor and replayed the entire feed to Discord
+                # on every stall window (live incident 2026-07-28).
+                return
             # The REST /api/events endpoint supplements in-memory events from
             # the audit DB, which uses UUID event_ids. The cursor protocol is
             # int-only, so those events are incompatible — skip them at ingest
@@ -127,6 +134,11 @@ class EventPoller:
             # event_id is now less than our cursor, reset to 0.
             if not events and cursor > 0:
                 probe = await self.gov.fetch_events(since=0, limit=50)
+                if probe is None:
+                    # The probe itself failed — no evidence about the server's
+                    # feed either way. Try again next poll; never reset on a
+                    # failed read.
+                    return
                 probe_ints = [
                     e["event_id"] for e in probe
                     if isinstance(e.get("event_id"), int)

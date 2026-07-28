@@ -72,11 +72,13 @@ async def test_governance_fetch_events_wrapped():
 
 @pytest.mark.asyncio
 async def test_governance_fetch_events_server_down():
+    """Failure must be None, not [] — the poller's stale-cursor reset relies
+    on distinguishing an errored fetch from a genuinely empty feed."""
     with mock_httpx_client_error("get", Exception("Connection refused")):
         client = GovernanceClient("http://localhost:8767")
         result = await client.fetch_events()
 
-    assert result == []
+    assert result is None
     assert client.consecutive_failures == 1
 
 
