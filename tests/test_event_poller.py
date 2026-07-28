@@ -11,21 +11,26 @@ import pytest
 from bridge.event_poller import EventPoller
 
 
+_UNSET = object()  # distinguishes "no probe configured" from probe_events=None
+# (None now means "the probe FETCH FAILED" — fetch_events' error value)
+
+
 def _make_poller(
-    events: list[dict],
+    events: list[dict] | None,
     *,
     residents_channel: discord.TextChannel | None = None,
     cursor: int = 0,
-    probe_events: list[dict] | None = None,
+    probe_events: object = _UNSET,
 ) -> tuple[EventPoller, list[tuple[str, discord.Embed]]]:
     """Build an EventPoller wired to fake gov client + capture queue.
 
-    If ``probe_events`` is provided, ``fetch_events`` returns ``events`` on
-    the first call (the real poll) and ``probe_events`` on subsequent calls
-    (the restart-detection probe from ``since=0``).
+    If ``probe_events`` is provided (including None = failed fetch),
+    ``fetch_events`` returns ``events`` on the first call (the real poll) and
+    ``probe_events`` on subsequent calls (the restart-detection probe from
+    ``since=0``).
     """
     gov = MagicMock()
-    if probe_events is None:
+    if probe_events is _UNSET:
         gov.fetch_events = AsyncMock(return_value=events)
     else:
         gov.fetch_events = AsyncMock(side_effect=[events, probe_events])
@@ -238,6 +243,29 @@ async def test_stale_cursor_check_skipped_when_cursor_is_zero():
     # Exactly one fetch (the normal poll); no probe.
     assert poller.gov.fetch_events.await_count == 1
     poller.cache.set_event_cursor.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_failed_fetch_never_resets_cursor():
+    # Live incident 2026-07-28: during a governance stall BOTH the normal
+    # fetch and the since=0 probe fail. A failed fetch (None) must read as
+    # "no evidence", not as "server feed is empty" — otherwise every stall
+    # resets the cursor and replays the whole feed to Discord.
+    poller, _ = _make_poller(events=None, cursor=45)
+    await poller._poll_loop_once()
+    poller.cache.set_event_cursor.assert_not_awaited()
+    # No probe either: exactly one fetch attempt this cycle.
+    assert poller.gov.fetch_events.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_probe_never_resets_cursor():
+    # Normal fetch succeeds-empty (feed rolled off), but the probe fails →
+    # still no evidence about the server's counter → no reset.
+    poller, _ = _make_poller(events=[], cursor=45, probe_events=None)
+    await poller._poll_loop_once()
+    poller.cache.set_event_cursor.assert_not_awaited()
+    assert poller.gov.fetch_events.await_count == 2
 
 
 @pytest.mark.asyncio

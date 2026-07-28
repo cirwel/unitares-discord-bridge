@@ -69,8 +69,16 @@ class GovernanceClient:
         # This keeps backwards compat for tests that don't call open().
         return httpx.AsyncClient(base_url=self.base_url, timeout=10, headers=self._headers)
 
-    async def fetch_events(self, since: int = 0, limit: int = 50) -> list[dict]:
-        """GET /api/events?since=N&limit=N. Returns [] on error."""
+    async def fetch_events(self, since: int = 0, limit: int = 50) -> list[dict] | None:
+        """GET /api/events?since=N&limit=N. Returns None on error.
+
+        The None-vs-[] distinction is load-bearing for the event poller's
+        stale-cursor detection: an errored fetch must never read as "the
+        server's feed is empty" — that misread made every transient governance
+        stall reset the cursor to 0 and replay the whole feed to Discord
+        (observed live 2026-07-28: the same events re-posted on every ~30-min
+        stall window).
+        """
         client = self._get_client()
         try:
             resp = await client.get(
@@ -87,7 +95,7 @@ class GovernanceClient:
         except Exception as exc:
             self.consecutive_failures += 1
             log.warning("governance fetch_events failed (%d): %s", self.consecutive_failures, exc)
-            return []
+            return None
         finally:
             if self._client is None:
                 await client.aclose()
