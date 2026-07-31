@@ -21,6 +21,7 @@ from bridge.event_poller import EventPoller
 from bridge.hud import HUDUpdater
 from bridge.lumen import LumenPoller
 from bridge.digest import LumenDigestPoller
+from bridge.acks import setup_acks
 from bridge.commands import setup_commands
 from bridge.ws_events import WSEventSubscriber
 
@@ -298,6 +299,7 @@ def main():
     if not DISCORD_TOKEN:
         raise ValueError("DISCORD_BOT_TOKEN environment variable is required")
     setup_commands(bot, gov_client, anima_client)
+    setup_acks(bot, gov_client)
     bot.run(DISCORD_TOKEN)
 
 
