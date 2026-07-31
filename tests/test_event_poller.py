@@ -399,3 +399,36 @@ async def test_id_only_signal_is_enriched_with_resident_label():
     assert routed[0][0] == "signals"
     assert routed[0][1].fields[0].name == "Agent"
     assert routed[0][1].fields[0].value == "opus_hikewa (fe5975a6-23c)"
+
+
+@pytest.mark.asyncio
+async def test_send_loop_survives_unexpected_send_error():
+    """A non-HTTP exception from channel.send must not kill the send loop —
+    the poll loop keeps writing the heartbeat, so a dead sender would be a
+    silent Discord outage the watchdog can't see."""
+    import contextlib
+
+    poller, _routed = _make_poller([])
+    # Undo the capture override — this test drives the real queue + send loop.
+    poller._message_queue = asyncio.Queue()
+
+    channel = MagicMock(spec=discord.TextChannel)
+    channel.name = "signals"
+    channel.send = AsyncMock(side_effect=[RuntimeError("boom"), MagicMock(id=1)])
+
+    embed = discord.Embed(title="t")
+    await poller._message_queue.put((channel, embed, {"type": "x"}))
+    await poller._message_queue.put((channel, embed, {"type": "y"}))
+
+    task = asyncio.create_task(poller._send_loop())
+    try:
+        for _ in range(100):
+            if channel.send.await_count >= 2:
+                break
+            await asyncio.sleep(0.05)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert channel.send.await_count == 2

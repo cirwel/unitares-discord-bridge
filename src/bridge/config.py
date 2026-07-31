@@ -45,6 +45,9 @@ SUPPRESSED_EVENT_TYPES = {
 # suppressed until the metric moves more than BRIDGE_DRIFT_REPEAT_DELTA or the
 # window elapses (periodic re-reminder). Suppressed events still reach the
 # ring buffer for /digest. Set BRIDGE_DRIFT_REPEAT_WINDOW_SECONDS=0 to disable.
+# The *_resolved twins are included because the resolved side floods the same
+# way when a server-side guard misbehaves (unitares#1421: identity_drift_resolved
+# re-emitted on every 3-minute check-in, ~480 posts/day to #signals).
 DRIFT_REPEAT_WINDOW_SECONDS = float(
     os.environ.get("BRIDGE_DRIFT_REPEAT_WINDOW_SECONDS", "21600")
 )
@@ -52,7 +55,9 @@ DRIFT_REPEAT_DELTA = float(os.environ.get("BRIDGE_DRIFT_REPEAT_DELTA", "0.05"))
 DRIFT_REPEAT_TYPES = {
     t.strip()
     for t in os.environ.get(
-        "BRIDGE_DRIFT_REPEAT_TYPES", "identity_drift,trajectory_drift"
+        "BRIDGE_DRIFT_REPEAT_TYPES",
+        "identity_drift,trajectory_drift,"
+        "identity_drift_resolved,trajectory_drift_resolved",
     ).split(",")
     if t.strip()
 }
