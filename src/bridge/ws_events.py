@@ -627,6 +627,23 @@ class WSEventSubscriber:
                         reason="discord_http_exception",
                         error=str(exc),
                     )
+            except Exception as exc:
+                # Anything not covered above (transport-layer errors, malformed
+                # embed state) must not kill the send loop: the poll/subscribe
+                # side keeps running and the heartbeat stays fresh, so a dead
+                # sender is a silent Discord outage the watchdog can't see.
+                # Log, record, drop this message, keep draining the queue.
+                log.error(
+                    "WS events: unexpected send error (%s); dropping message",
+                    exc, exc_info=exc,
+                )
+                await self._record_receipt(
+                    "bridge.delivery_failed",
+                    source_event=source_event,
+                    channel=channel,
+                    reason="send_loop_unexpected_error",
+                    error=str(exc),
+                )
             # 150 ms pacing between sends — matches event_poller to stay
             # well under Discord's per-route burst limits.
             await asyncio.sleep(0.15)

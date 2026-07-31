@@ -515,3 +515,88 @@ def test_repeat_drift_disabled_by_zero_window(monkeypatch):
     sub = _bare_subscriber()
     assert sub._suppress_repeat_drift(_drift()) is False
     assert sub._suppress_repeat_drift(_drift()) is False
+
+
+def test_repeat_drift_default_types_include_resolved():
+    """The *_resolved twins flood the same way the drift side does when a
+    server-side emit guard misbehaves (unitares#1421: identity_drift_resolved
+    re-emitted on every 3-minute check-in). The default suppression set must
+    cover them so the bridge is safe even before the server fix deploys."""
+    from bridge import config
+
+    assert "identity_drift_resolved" in config.DRIFT_REPEAT_TYPES
+    assert "trajectory_drift_resolved" in config.DRIFT_REPEAT_TYPES
+
+
+def test_repeat_drift_suppresses_resolved_repeats():
+    sub = _bare_subscriber()
+    resolved = _drift(sim=0.628, etype="identity_drift_resolved")
+    assert sub._suppress_repeat_drift(resolved) is False
+    assert sub._suppress_repeat_drift(resolved) is True
+    # Within delta — still the same static condition.
+    assert sub._suppress_repeat_drift(
+        _drift(sim=0.629, etype="identity_drift_resolved")
+    ) is True
+
+
+def test_repeat_drift_tracks_drift_and_resolved_separately():
+    """Alternating drift/resolved for one agent posts each side once — the
+    (type, agent) key keeps their metric histories independent."""
+    sub = _bare_subscriber()
+    assert sub._suppress_repeat_drift(_drift(sim=0.27)) is False
+    assert sub._suppress_repeat_drift(
+        _drift(sim=0.628, etype="identity_drift_resolved")
+    ) is False
+    assert sub._suppress_repeat_drift(_drift(sim=0.27)) is True
+    assert sub._suppress_repeat_drift(
+        _drift(sim=0.628, etype="identity_drift_resolved")
+    ) is True
+
+
+# ---------------------------------------------------------------------------
+# send-loop resilience
+# ---------------------------------------------------------------------------
+
+
+import asyncio
+import contextlib
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+
+@pytest.mark.asyncio
+async def test_ws_send_loop_survives_unexpected_send_error():
+    """A non-HTTP exception from channel.send must not kill the send loop.
+
+    The poll/subscribe side keeps running and the heartbeat stays fresh, so a
+    dead sender is a silent Discord outage the watchdog can't see — the loop
+    has to drop the poisoned message and keep draining the queue."""
+    from bridge.ws_events import WSEventSubscriber
+
+    sub = WSEventSubscriber.__new__(WSEventSubscriber)
+    sub._stop_event = asyncio.Event()
+    sub._send_queue = asyncio.Queue()
+    sub.gov = None  # receipts are best-effort; None skips them
+
+    channel = MagicMock(spec=discord.TextChannel)
+    channel.name = "signals"
+    channel.send = AsyncMock(side_effect=[RuntimeError("boom"), MagicMock(id=1)])
+
+    embed = discord.Embed(title="t")
+    await sub._send_queue.put((channel, embed, {"type": "x"}))
+    await sub._send_queue.put((channel, embed, {"type": "y"}))
+
+    task = asyncio.create_task(sub._send_loop())
+    try:
+        for _ in range(100):
+            if channel.send.await_count >= 2:
+                break
+            await asyncio.sleep(0.05)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert channel.send.await_count == 2
+    assert not task.done() or task.cancelled()  # loop was alive until we cancelled it
