@@ -16,6 +16,17 @@ EVENT_POLL_INTERVAL = int(os.environ.get("EVENT_POLL_INTERVAL", "10"))
 HUD_UPDATE_INTERVAL = int(os.environ.get("HUD_UPDATE_INTERVAL", "30"))
 SENSOR_POLL_INTERVAL = int(os.environ.get("SENSOR_POLL_INTERVAL", "300"))
 
+# Reaction(s) that count as acknowledging a delivered event. Comma-separated so
+# a deployment can accept more than one gesture. Kept to an explicit set rather
+# than "any reaction" so an unrelated reaction cannot silently clear a
+# high-severity alert from the attention surface.
+ACK_EMOJI = frozenset(
+    e.strip() for e in os.environ.get("BRIDGE_ACK_EMOJI", "✅").split(",") if e.strip()
+)
+# Optional salt for operator_id_hash. Discord user ids are low-entropy, so an
+# unsalted digest is reversible by anyone who can enumerate the guild.
+ACK_HASH_SALT = os.environ.get("BRIDGE_ACK_HASH_SALT", "")
+
 # Lumen Q&A digest: periodic summary of Lumen's self-asked questions and how
 # often relational (aloneness/presence) themes recur. Disabled if the
 # lumen-digest channel is absent. Defaults: post weekly, summarise the last
