@@ -64,6 +64,39 @@ def _safe_float(value, default: float = 0.0) -> float:
         return default
 
 
+def _humanize_seconds(s: float) -> str:
+    return f"{round(s / 60)}min" if s < 5400 else f"{s / 3600:.1f}h"
+
+
+def _evidence_line(ev: dict) -> str:
+    """Render the server-computed event check for a forced-release finding.
+
+    Scope honesty mirrors the governance dashboard: the lease row and the
+    finding's source event are written by one lease-plane transaction, so a
+    match is never phrased as independent corroboration, and only the
+    missing-row state (a lease-plane integrity fault) reads as alarming.
+    """
+    assessment = ev.get("assessment")
+    if assessment == "event_recorded":
+        bits = ["lease row present", "release_reason=forced"]
+        if ev.get("held_x_ttl") is not None:
+            bits.append(f"held {ev['held_x_ttl']}× TTL")
+        if ev.get("holder_pid_null"):
+            bits.append("holder pid null")
+        latency = ev.get("report_latency_s")
+        if isinstance(latency, (int, float)) and latency >= 300:
+            bits.append(f"reported {_humanize_seconds(latency)} after the event")
+        return " · ".join(bits) + "\n-# same-transaction record — not independent corroboration"
+    if assessment == "no_lease_row":
+        return "⚠ no lease row for the claimed lease id — lease-plane integrity fault; escalate"
+    if assessment == "lookup_mismatch":
+        note = ev.get("note")
+        return ("finding did not resolve to a matching lease row"
+                + (f" — {note}" if note else "")
+                + "\n-# almost certainly an evidence-side fault, not a wrong finding")
+    return "machine check errored — no evidence either way"
+
+
 def event_to_embed(event: dict) -> discord.Embed:
     """Convert a governance event dict to a Discord embed."""
     severity = event.get("severity", "info")
@@ -110,6 +143,12 @@ def event_to_embed(event: dict) -> discord.Embed:
             embed.add_field(name="Location", value=loc, inline=False)
         if event.get("violation_class"):
             embed.add_field(name="Violation", value=event["violation_class"], inline=True)
+
+    # Server-computed event check, attached at ingest for forced-release
+    # findings (any event type — governance owns the computation).
+    ev = event.get("evidence")
+    if isinstance(ev, dict) and ev.get("kind") == "forced_release":
+        embed.add_field(name="Event check", value=_evidence_line(ev)[:1024], inline=False)
 
     embed.set_footer(text=f"Event #{event.get('event_id', '?')}")
     return embed
