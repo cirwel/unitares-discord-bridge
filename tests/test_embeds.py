@@ -183,3 +183,46 @@ def test_event_agent_field_includes_name_and_id_when_both_present():
 
     assert embed.fields[0].name == "Agent"
     assert embed.fields[0].value == "opus_hikewa (fe5975a6-23c)"
+
+
+def test_forced_release_evidence_field_renders():
+    event = {
+        "event_id": 43, "type": "sentinel_alarm_finding", "severity": "high",
+        "message": "forced release: resident:/steward (lease 5d09980f-1c91-4271-ab94-723564b5a597)",
+        "agent_id": "sentinel", "agent_name": "Sentinel",
+        "timestamp": "2026-08-01T12:00:00+00:00",
+        "evidence": {
+            "kind": "forced_release", "assessment": "event_recorded",
+            "release_reason": "forced", "held_x_ttl": 6.2,
+            "holder_pid_null": True, "report_latency_s": 26620.0,
+        },
+    }
+    embed = event_to_embed(event)
+    check = next(f for f in embed.fields if f.name == "Event check")
+    assert "held 6.2× TTL" in check.value
+    assert "7.4h after the event" in check.value
+    assert "not independent corroboration" in check.value
+
+
+def test_no_lease_row_evidence_reads_as_integrity_fault():
+    event = {
+        "event_id": 44, "type": "sentinel_alarm_finding", "severity": "high",
+        "message": "forced release: resident:/steward (lease 5d09980f-1c91-4271-ab94-723564b5a597)",
+        "agent_id": "sentinel", "agent_name": "Sentinel",
+        "timestamp": "2026-08-01T12:00:00+00:00",
+        "evidence": {"kind": "forced_release", "assessment": "no_lease_row"},
+    }
+    embed = event_to_embed(event)
+    check = next(f for f in embed.fields if f.name == "Event check")
+    assert "integrity fault" in check.value
+
+
+def test_events_without_evidence_get_no_check_field():
+    event = {
+        "event_id": 45, "type": "sentinel_finding", "severity": "high",
+        "message": "fleet coherence dipped",
+        "agent_id": "sentinel", "agent_name": "Sentinel",
+        "timestamp": "2026-08-01T12:00:00+00:00",
+    }
+    embed = event_to_embed(event)
+    assert all(f.name != "Event check" for f in embed.fields)
