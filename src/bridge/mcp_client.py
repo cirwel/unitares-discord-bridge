@@ -290,9 +290,22 @@ def _derive_verdict(data: dict) -> str:
 
     risk = data.get("risk_score", {})
     risk_status = risk.get("status", "").lower() if isinstance(risk, dict) else ""
-    basin = str(data.get("basin", "")).lower()
+    # basin arrives as {"value": "low", "meaning": ..., "thresholds": {...}},
+    # the same wrapped shape _scalar already unwraps for E/I/S/V. The previous
+    # `str(data.get("basin"))` stringified the whole dict, so no basin
+    # comparison below could ever match and the branch was dead: every agent
+    # fell through to "guide" via risk_score, and a degraded agent was painted
+    # the same colour as a healthy one. Live at the time of the fix: Lumen at
+    # basin=low / 🔴 critical rendered yellow.
+    basin_raw = data.get("basin", "")
+    if isinstance(basin_raw, dict):
+        basin_raw = basin_raw.get("value", "")
+    basin = str(basin_raw or "").lower()
 
-    if "high" in risk_status or basin == "low":
+    # Basin is checked before risk: it is the governance-level judgement, and a
+    # "low" basin with only medium risk is exactly the case the old ordering
+    # mislabelled.
+    if basin == "low" or "high" in risk_status:
         return "pause"
     if "medium" in risk_status or "moderate" in risk_status:
         return "guide"
