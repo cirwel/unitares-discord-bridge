@@ -33,6 +33,7 @@ import websockets
 import websockets.exceptions
 
 from bridge import config
+from bridge.embeds import finding_resident_key, is_finding_event
 from bridge.mcp_client import GovernanceClient
 
 from bridge.tasks import cancel_tasks, create_logged_task
@@ -293,6 +294,7 @@ class WSEventSubscriber:
         taxonomy_reverse: Optional[dict] = None,
         lease_plane_phase_b_channel: Optional[discord.TextChannel] = None,
         gov_client: Optional[GovernanceClient] = None,
+        resident_channels: Optional[dict[str, discord.TextChannel]] = None,
     ) -> None:
         self.ws_url = ws_url_from_http(governance_url)
         self.gov = gov_client
@@ -304,6 +306,11 @@ class WSEventSubscriber:
         # channel (in addition to the main #events feed). Disabled by passing
         # None or an empty dict.
         self.class_channels = class_channels or {}
+        # Per-resident finding channels: {"sentinel": channel, ...}. A finding
+        # from a resident in this map goes to its channel instead of the shared
+        # signals feed — the WS twin of the REST poller's routing. Residents
+        # without an entry are unaffected (this path has no #residents feed).
+        self.resident_channels = resident_channels or {}
         self.taxonomy_reverse = taxonomy_reverse or {}
         # Operator-managed channel for lease_plane_phase_b_transition events
         # emitted by Sentinel after a §6.1 criterion (or overall promotable)
@@ -417,6 +424,13 @@ class WSEventSubscriber:
                 pass
             delay = min(delay * 2, self.reconnect_max)
 
+    def _resident_channel(self, event: dict) -> Optional[discord.TextChannel]:
+        """Dedicated channel for this finding's author, if it has one."""
+        if not self.resident_channels or not is_finding_event(event):
+            return None
+        key = finding_resident_key(event)
+        return self.resident_channels.get(key) if key else None
+
     async def _dispatch(self, event: dict) -> None:
         # Record every typed event (including ones we don't turn into an
         # embed) so /digest can aggregate them later. This is the single
@@ -449,6 +463,9 @@ class WSEventSubscriber:
             return
         bucket = classify_broadcaster_event(event)
         target = self.activity_channel if bucket == "activity" else self.signals_channel
+        resident_ch = self._resident_channel(event)
+        if resident_ch is not None:
+            target = resident_ch
         try:
             self._send_queue.put_nowait((target, embed, event))
         except asyncio.QueueFull:

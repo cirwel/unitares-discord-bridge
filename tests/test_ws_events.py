@@ -1,12 +1,14 @@
 """Tests for bridge.ws_events pure helpers.
 
-The network-facing :class:`WSEventSubscriber` is not exercised here — its
-value is hard to mock meaningfully without also mocking Discord. These
-tests pin the classification logic so future event types don't silently
-regress to "invisible in Discord".
+The network-facing side of :class:`WSEventSubscriber` is not exercised here —
+its value is hard to mock meaningfully without also mocking Discord — but its
+dispatch/routing decisions are, by draining the send queue. These tests pin the
+classification logic so future event types don't silently regress to
+"invisible in Discord".
 """
 
 import discord
+import pytest
 
 from bridge.ws_events import (
     _SEND_QUEUE_MAX,
@@ -600,3 +602,92 @@ async def test_ws_send_loop_survives_unexpected_send_error():
 
     assert channel.send.await_count == 2
     assert not task.done() or task.cancelled()  # loop was alive until we cancelled it
+
+
+# ---------------------------------------------------------------------------
+# Per-resident finding routing (WS twin of the REST poller's routing)
+# ---------------------------------------------------------------------------
+
+
+def _subscriber_with_resident_channels(*names: str):
+    """Build a subscriber whose send queue is captured instead of sent."""
+    from unittest.mock import MagicMock
+
+    from bridge.ws_events import WSEventSubscriber
+
+    def channel(name):
+        ch = MagicMock(spec=discord.TextChannel)
+        ch.name = name
+        return ch
+
+    sub = WSEventSubscriber(
+        "http://localhost:8767",
+        channel("activity"),
+        channel("signals"),
+        channel("alerts"),
+        resident_channels={name: channel(name) for name in names},
+    )
+    return sub
+
+
+async def _dispatch_and_collect(sub, event) -> list[str]:
+    await sub._dispatch(event)
+    hit = []
+    while not sub._send_queue.empty():
+        ch, _embed, _src = sub._send_queue.get_nowait()
+        hit.append(ch.name)
+    return hit
+
+
+@pytest.mark.asyncio
+async def test_ws_sentinel_finding_routes_to_its_own_channel():
+    sub = _subscriber_with_resident_channels("sentinel", "doctor")
+    hit = await _dispatch_and_collect(sub, {
+        "type": "sentinel_finding", "severity": "medium",
+        "agent_id": "sentinel", "agent_label": "Sentinel",
+    })
+    assert hit == ["sentinel"]
+
+
+@pytest.mark.asyncio
+async def test_ws_doctor_finding_routes_to_its_own_channel():
+    sub = _subscriber_with_resident_channels("sentinel", "doctor")
+    hit = await _dispatch_and_collect(sub, {
+        "type": "doctor_finding", "severity": "medium",
+        "agent_id": "doctor", "agent_label": "Doctor",
+    })
+    assert hit == ["doctor"]
+
+
+@pytest.mark.asyncio
+async def test_ws_finding_without_own_channel_stays_in_signals():
+    # This path has no #residents feed — Vigil keeps its existing behaviour.
+    sub = _subscriber_with_resident_channels("sentinel", "doctor")
+    hit = await _dispatch_and_collect(sub, {
+        "type": "vigil_finding", "severity": "medium",
+        "agent_id": "vigil", "agent_label": "Vigil",
+    })
+    assert hit == ["signals"]
+
+
+@pytest.mark.asyncio
+async def test_ws_critical_finding_still_mirrors_to_alerts():
+    sub = _subscriber_with_resident_channels("sentinel")
+    hit = await _dispatch_and_collect(sub, {
+        "type": "sentinel_finding", "severity": "high",
+        "agent_id": "sentinel", "agent_label": "Sentinel",
+        "tags": ["critical"],
+    })
+    assert hit == ["sentinel", "alerts"]
+
+
+@pytest.mark.asyncio
+async def test_ws_non_finding_from_sentinel_is_not_rerouted():
+    # lifecycle_paused names the *subject* agent, not the finding's author —
+    # routing it by agent id would drain the main feed into #sentinel.
+    sub = _subscriber_with_resident_channels("sentinel")
+    hit = await _dispatch_and_collect(sub, {
+        "type": "lifecycle_paused", "agent_id": "sentinel",
+        "agent_label": "Sentinel", "reason": "manual",
+    })
+    assert hit == ["signals", "alerts"]

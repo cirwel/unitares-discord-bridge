@@ -11,6 +11,7 @@ from bridge.config import (
     GOVERNANCE_TOKEN, ANIMA_TOKEN,
     EVENT_POLL_INTERVAL, HUD_UPDATE_INTERVAL, SENSOR_POLL_INTERVAL, DB_PATH,
     CLASS_ROUTING_ENABLED, LEASE_PLANE_PHASE_B_CHANNEL_ID,
+    RESIDENT_FINDING_CHANNELS,
     DIGEST_ENABLED, DIGEST_INTERVAL, DIGEST_WINDOW, DIGEST_CHECK_INTERVAL,
     DIGEST_RELATIONAL_THRESHOLD,
 )
@@ -103,7 +104,11 @@ async def on_ready():
         else:
             log.warning("Class routing enabled but taxonomy fetch failed")
 
-    channels = await ensure_server_structure(guild, taxonomy=taxonomy)
+    channels = await ensure_server_structure(
+        guild,
+        taxonomy=taxonomy,
+        resident_channels=RESIDENT_FINDING_CHANNELS,
+    )
     log.info("Server structure ready: %d channels", len(channels))
 
     # Open the SQLite cache for event cursors, HUD state, etc.
@@ -117,15 +122,29 @@ async def on_ready():
     alerts_ch = channels.get("alerts")
     residents_ch = channels.get("residents")
     audit_channel = channels.get("audit-log")
+
+    # Residents with a channel of their own (Sentinel, Doctor) — their findings
+    # go there instead of the shared #residents feed. A key whose channel is
+    # missing just falls back, so a partial map is safe.
+    resident_channels: dict[str, discord.TextChannel] = {
+        key: ch
+        for key in RESIDENT_FINDING_CHANNELS
+        if isinstance(ch := channels.get(key), discord.TextChannel)
+    }
+
     if activity_ch and signals_ch and alerts_ch:
         event_poller = EventPoller(
             gov_client, cache, activity_ch, signals_ch, alerts_ch,
             EVENT_POLL_INTERVAL,
             audit_channel=audit_channel,
             residents_channel=residents_ch,
+            resident_channels=resident_channels,
         )
         await event_poller.start()
-        log.info("Event poller started")
+        log.info(
+            "Event poller started (resident channels: %s)",
+            ", ".join(f"#{k}" for k in resident_channels) or "none",
+        )
 
         # Build the per-class channel map for the WS subscriber. Keys are
         # class ids (e.g. "INT"), values are Discord TextChannel objects.
@@ -171,6 +190,7 @@ async def on_ready():
             taxonomy_reverse=(taxonomy or {}).get("reverse") or {},
             lease_plane_phase_b_channel=phase_b_ch,
             gov_client=gov_client,
+            resident_channels=resident_channels,
         )
         await ws_subscriber.start()
         log.info(

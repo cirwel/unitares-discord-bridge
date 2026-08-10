@@ -1,5 +1,11 @@
 import discord
-from bridge.embeds import classify_rest_event, event_to_embed, is_critical_event
+from bridge.embeds import (
+    classify_rest_event,
+    event_to_embed,
+    finding_resident_key,
+    is_critical_event,
+    is_finding_event,
+)
 
 
 def test_verdict_change_embed():
@@ -226,3 +232,47 @@ def test_events_without_evidence_get_no_check_field():
     }
     embed = event_to_embed(event)
     assert all(f.name != "Event check" for f in embed.fields)
+
+
+# ---------------------------------------------------------------------------
+# Finding attribution — which resident authored a finding
+# ---------------------------------------------------------------------------
+
+
+def test_is_finding_event_covers_qualified_and_bare_types():
+    assert is_finding_event({"type": "sentinel_finding"})
+    assert is_finding_event({"type": "sentinel_alarm_finding"})
+    assert is_finding_event({"type": "finding"})
+    assert not is_finding_event({"type": "verdict_change"})
+    assert not is_finding_event({"type": "finding_review"})
+    assert not is_finding_event({})
+
+
+def test_finding_resident_key_from_type_prefix():
+    assert finding_resident_key({"type": "sentinel_finding"}) == "sentinel"
+    assert finding_resident_key({"type": "doctor_finding"}) == "doctor"
+    assert finding_resident_key({"type": "vigil_finding"}) == "vigil"
+    # Qualified finding types still belong to the resident named first.
+    assert finding_resident_key({"type": "sentinel_alarm_finding"}) == "sentinel"
+
+
+def test_finding_resident_key_is_case_insensitive():
+    assert finding_resident_key({"type": "Doctor_Finding"}) == "doctor"
+
+
+def test_bare_finding_type_falls_back_to_identity_fields():
+    # No author in the type — prefer the label over an opaque id.
+    assert finding_resident_key({
+        "type": "finding",
+        "agent_id": "fe5975a6-23c7-4e55-9a9d-9c4bdb9b45a7",
+        "agent_label": "Doctor",
+    }) == "doctor"
+    assert finding_resident_key({"type": "finding", "agent_id": "Sentinel"}) == "sentinel"
+    assert finding_resident_key({"type": "finding"}) is None
+
+
+def test_finding_resident_key_ignores_non_findings():
+    # A verdict change *about* Sentinel is not a Sentinel finding.
+    assert finding_resident_key({
+        "type": "verdict_change", "agent_id": "sentinel",
+    }) is None
