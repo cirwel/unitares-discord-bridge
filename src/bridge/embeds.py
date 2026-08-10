@@ -226,4 +226,12 @@ def is_critical_event(event: dict) -> bool:
     # Findings are high-signal by construction — high severity also pages alerts
     if event.get("type", "").endswith("_finding") and severity == "high":
         return True
+    # A dialectic that has asked for a human is the one event class where the
+    # ONLY resolution is a person acting. It carries no `critical` severity, so
+    # it used to land in #signals — ~600 events/hour — where it is delivered and
+    # unreadable. That is why 6 genuine facilitation requests over nine months
+    # were answered by nobody: not missed by the poller (it uses a cursor), just
+    # buried. #alerts is low-volume by construction, which is the whole point.
+    if event.get("type") == "dialectic_facilitation_needed":
+        return True
     return False
