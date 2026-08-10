@@ -11,7 +11,13 @@ import discord
 
 from bridge import config
 from bridge.cache import BridgeCache
-from bridge.embeds import classify_rest_event, event_to_embed, is_critical_event
+from bridge.embeds import (
+    classify_rest_event,
+    event_to_embed,
+    finding_resident_key,
+    is_critical_event,
+    is_finding_event,
+)
 from bridge.mcp_client import GovernanceClient, fetch_agents
 from bridge.tasks import cancel_tasks, create_logged_task
 
@@ -55,6 +61,7 @@ class EventPoller:
         interval: int = 10,
         audit_channel: discord.TextChannel | None = None,
         residents_channel: discord.TextChannel | None = None,
+        resident_channels: dict[str, discord.TextChannel] | None = None,
     ) -> None:
         self.gov = gov_client
         self.cache = cache
@@ -64,12 +71,30 @@ class EventPoller:
         self.interval = interval
         self.audit_channel = audit_channel
         self.residents_channel = residents_channel
+        # {"sentinel": channel, "doctor": channel} — a resident with its own
+        # channel gets its findings there; everyone else falls back to
+        # ``residents_channel``.
+        self.resident_channels = resident_channels or {}
         self._task: asyncio.Task | None = None
         self._send_task: asyncio.Task | None = None
         self._gov_alert_sent: bool = False
         self._message_queue: asyncio.Queue[tuple[discord.TextChannel, discord.Embed, dict | None]] = (
             asyncio.Queue(maxsize=100)
         )
+
+    def _finding_channel(self, event: dict) -> discord.TextChannel | None:
+        """Channel a finding belongs in, or ``None`` if it isn't a finding.
+
+        A resident with its own channel (Sentinel, Doctor) wins; every other
+        resident falls back to the shared #residents feed. ``None`` is also
+        returned when neither exists, so the caller routes by activity/signals
+        as before.
+        """
+        if not is_finding_event(event):
+            return None
+        key = finding_resident_key(event)
+        own = self.resident_channels.get(key) if key else None
+        return own or self.residents_channel
 
     async def start(self) -> None:
         """Spawn the poll and send loops as background tasks."""
@@ -181,16 +206,14 @@ class EventPoller:
                 try:
                     event_for_embed = _with_resident_label(event, label_by_id)
                     embed = event_to_embed(event_for_embed)
-                    is_finding = event.get("type", "").endswith("_finding")
-                    if is_finding and self.residents_channel is not None:
-                        await self._message_queue.put((self.residents_channel, embed, event))
-                    else:
+                    target = self._finding_channel(event)
+                    if target is None:
                         bucket = classify_rest_event(event)
                         target = (
                             self.activity_channel if bucket == "activity"
                             else self.signals_channel
                         )
-                        await self._message_queue.put((target, embed, event))
+                    await self._message_queue.put((target, embed, event))
                     if is_critical_event(event):
                         await self._message_queue.put((self.alerts_channel, embed, event))
                 except Exception as exc:

@@ -162,10 +162,53 @@ _ACTIVITY_REST_TYPES = frozenset({
 })
 
 
+_FINDING_SUFFIX = "_finding"
+
+# Identity fields consulted only for a bare ``finding`` type, which carries no
+# author in its name. Labels first — they match the operator-facing resident
+# names ("sentinel"), where ids may be opaque UUIDs.
+_RESIDENT_ID_KEYS = (
+    "resident_label",
+    "agent_label",
+    "resident_name",
+    "agent_name",
+    "resident_id",
+    "agent_id",
+)
+
+
+def is_finding_event(event: dict) -> bool:
+    """True for resident findings — ``sentinel_finding``, ``vigil_finding``, …"""
+    t = str(event.get("type") or "").strip().lower()
+    return t == "finding" or t.endswith(_FINDING_SUFFIX)
+
+
+def finding_resident_key(event: dict) -> str | None:
+    """Return the lowercased resident that authored a finding, else ``None``.
+
+    Findings are named after their author, so the event-type prefix up to the
+    first underscore is the resident: ``sentinel_finding`` and
+    ``sentinel_alarm_finding`` both resolve to ``"sentinel"``. A bare
+    ``finding`` type has no author in its name and falls back to the event's
+    identity fields. Used to route a resident's findings to its own channel.
+    """
+    if not is_finding_event(event):
+        return None
+    t = str(event.get("type") or "").strip().lower()
+    prefix = t[: -len(_FINDING_SUFFIX)] if t.endswith(_FINDING_SUFFIX) else ""
+    if prefix:
+        return prefix.split("_", 1)[0]
+    for key in _RESIDENT_ID_KEYS:
+        value = event.get(key)
+        if value:
+            return str(value).strip().lower()
+    return None
+
+
 def classify_rest_event(event: dict) -> str:
     """Return ``"activity"`` for routine REST events, ``"signals"`` otherwise.
 
-    Findings route to #residents and never reach this helper.
+    Findings route to a resident channel and never reach this helper.
     """
     t = event.get("type") or ""
     if t in _ACTIVITY_REST_TYPES:

@@ -40,6 +40,14 @@ Copy `.env.example` to `.env` and set:
 
 Optional: `GOVERNANCE_API_TOKEN`, `ANIMA_API_TOKEN` for authenticated MCP calls.
 
+### Resident channels
+
+Findings are routed by their author. Residents listed in
+`BRIDGE_RESIDENT_FINDING_CHANNELS` (default `sentinel,doctor`) get a text
+channel of their own in the `GOVERNANCE` category, created on startup; every
+other resident's findings keep landing in the shared `#residents` feed. Set the
+variable to an empty string to put everyone back on `#residents`.
+
 ## Run
 
 ```bash

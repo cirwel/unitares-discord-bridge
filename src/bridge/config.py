@@ -73,6 +73,28 @@ DRIFT_REPEAT_TYPES = {
     if t.strip()
 }
 
+def _channel_key(raw: str) -> str:
+    """Normalise a resident key into a Discord-legal text channel name."""
+    return "-".join(raw.strip().lower().split())
+
+
+# Residents that get their own findings channel instead of sharing #residents.
+# A finding is attributed to its author by event-type prefix (sentinel_finding
+# and sentinel_alarm_finding -> "sentinel") or, for a bare `finding` type, by
+# the event's agent id/label. Each key becomes a text channel of the same name
+# in the GOVERNANCE category; residents without one keep falling back to
+# #residents, so Vigil/Watcher behaviour is unchanged. Set the env var to ""
+# to put every resident back in the shared channel.
+RESIDENT_FINDING_CHANNELS: tuple[str, ...] = tuple(
+    dict.fromkeys(
+        _channel_key(k)
+        for k in os.environ.get(
+            "BRIDGE_RESIDENT_FINDING_CHANNELS", "sentinel,doctor"
+        ).split(",")
+        if _channel_key(k)
+    )
+)
+
 # Per-class routing — when enabled, broadcaster events that map to a
 # violation class (via /v1/taxonomy reverse-lookup) are mirrored to a
 # class-specific text channel in addition to the main #events channel.

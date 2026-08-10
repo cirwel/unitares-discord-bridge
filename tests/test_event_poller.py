@@ -19,6 +19,7 @@ def _make_poller(
     events: list[dict] | None,
     *,
     residents_channel: discord.TextChannel | None = None,
+    resident_channels: dict[str, discord.TextChannel] | None = None,
     cursor: int = 0,
     probe_events: object = _UNSET,
 ) -> tuple[EventPoller, list[tuple[str, discord.Embed]]]:
@@ -51,6 +52,7 @@ def _make_poller(
     poller = EventPoller(
         gov, cache, activity_ch, signals_ch, alerts_ch,
         residents_channel=residents_channel,
+        resident_channels=resident_channels,
     )
 
     routed: list[tuple[str, discord.Embed]] = []
@@ -67,6 +69,16 @@ def _make_residents_channel() -> MagicMock:
     ch = MagicMock(spec=discord.TextChannel)
     ch.name = "residents"
     return ch
+
+
+def _make_channel(name: str) -> MagicMock:
+    ch = MagicMock(spec=discord.TextChannel)
+    ch.name = name
+    return ch
+
+
+def _resident_channels(*names: str) -> dict[str, MagicMock]:
+    return {name: _make_channel(name) for name in names}
 
 
 @pytest.mark.asyncio
@@ -164,6 +176,104 @@ async def test_finding_falls_back_to_signals_without_residents_channel():
     assert "signals" in channels_hit
     assert "activity" not in channels_hit
     assert "residents" not in channels_hit
+
+
+@pytest.mark.asyncio
+async def test_sentinel_finding_routes_to_its_own_channel():
+    poller, routed = _make_poller(
+        [{"event_id": 1, "type": "sentinel_finding", "severity": "medium",
+          "message": "m", "agent_id": "sentinel", "agent_name": "Sentinel"}],
+        residents_channel=_make_residents_channel(),
+        resident_channels=_resident_channels("sentinel", "doctor"),
+    )
+    await poller._poll_loop_once()
+    channels_hit = [name for name, _ in routed]
+    assert channels_hit == ["sentinel"]
+    assert "residents" not in channels_hit
+    assert "doctor" not in channels_hit
+
+
+@pytest.mark.asyncio
+async def test_doctor_finding_routes_to_its_own_channel():
+    poller, routed = _make_poller(
+        [{"event_id": 1, "type": "doctor_finding", "severity": "medium",
+          "message": "m", "agent_id": "doctor", "agent_name": "Doctor"}],
+        residents_channel=_make_residents_channel(),
+        resident_channels=_resident_channels("sentinel", "doctor"),
+    )
+    await poller._poll_loop_once()
+    assert [name for name, _ in routed] == ["doctor"]
+
+
+@pytest.mark.asyncio
+async def test_qualified_finding_type_still_routes_by_author():
+    # sentinel_alarm_finding is Sentinel's too — the author is the type prefix
+    # up to the first underscore, not the whole pre-_finding string.
+    poller, routed = _make_poller(
+        [{"event_id": 1, "type": "sentinel_alarm_finding", "severity": "medium",
+          "message": "m", "agent_id": "sentinel", "agent_name": "Sentinel"}],
+        residents_channel=_make_residents_channel(),
+        resident_channels=_resident_channels("sentinel"),
+    )
+    await poller._poll_loop_once()
+    assert [name for name, _ in routed] == ["sentinel"]
+
+
+@pytest.mark.asyncio
+async def test_other_residents_still_use_shared_channel():
+    # Vigil/Watcher have no channel of their own — #residents is unchanged.
+    poller, routed = _make_poller(
+        [{"event_id": 1, "type": "vigil_finding", "severity": "medium",
+          "message": "m", "agent_id": "vigil", "agent_name": "Vigil"}],
+        residents_channel=_make_residents_channel(),
+        resident_channels=_resident_channels("sentinel", "doctor"),
+    )
+    await poller._poll_loop_once()
+    assert [name for name, _ in routed] == ["residents"]
+
+
+@pytest.mark.asyncio
+async def test_own_channel_finding_still_mirrors_to_alerts():
+    poller, routed = _make_poller(
+        [{"event_id": 1, "type": "sentinel_finding", "severity": "high",
+          "message": "m", "agent_id": "sentinel", "agent_name": "Sentinel"}],
+        residents_channel=_make_residents_channel(),
+        resident_channels=_resident_channels("sentinel"),
+    )
+    await poller._poll_loop_once()
+    channels_hit = [name for name, _ in routed]
+    assert "sentinel" in channels_hit
+    assert "alerts" in channels_hit
+    assert "residents" not in channels_hit
+
+
+@pytest.mark.asyncio
+async def test_own_channel_missing_falls_back_to_residents():
+    # Channel creation failed / operator deleted it — findings must still land
+    # somewhere rather than vanish.
+    poller, routed = _make_poller(
+        [{"event_id": 1, "type": "doctor_finding", "severity": "info",
+          "message": "m", "agent_id": "doctor", "agent_name": "Doctor"}],
+        residents_channel=_make_residents_channel(),
+        resident_channels=_resident_channels("sentinel"),
+    )
+    await poller._poll_loop_once()
+    assert [name for name, _ in routed] == ["residents"]
+
+
+@pytest.mark.asyncio
+async def test_non_finding_from_sentinel_stays_in_signals():
+    # Only findings are routed by author. A verdict change *about* Sentinel is
+    # ordinary governance traffic and belongs in the main feed.
+    poller, routed = _make_poller(
+        [{"event_id": 1, "type": "verdict_change", "severity": "warning",
+          "message": "m", "agent_id": "sentinel", "agent_name": "Sentinel",
+          "from": "proceed", "to": "guide"}],
+        residents_channel=_make_residents_channel(),
+        resident_channels=_resident_channels("sentinel"),
+    )
+    await poller._poll_loop_once()
+    assert [name for name, _ in routed] == ["signals"]
 
 
 @pytest.mark.asyncio
