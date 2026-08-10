@@ -46,6 +46,25 @@ def test_is_critical_for_critical_severity():
     assert is_critical_event({"type": "risk_threshold", "severity": "critical"})
 
 
+def test_facilitation_request_pages_alerts():
+    """
+    A dialectic waiting on a human must reach #alerts.
+
+    It carries no `critical` severity, so before this it classified to #signals
+    — roughly 600 events/hour — where it was delivered and unreadable. Six
+    genuine requests over nine months went unanswered that way.
+    """
+    assert is_critical_event(
+        {"type": "dialectic_facilitation_needed", "severity": "warning"}
+    )
+
+
+def test_other_dialectic_events_do_not_page():
+    """Only the request for a human pages. Ordinary phase traffic does not."""
+    for t in ("dialectic_opened", "dialectic_phase_changed", "dialectic_resolved"):
+        assert not is_critical_event({"type": t, "severity": "info"}), t
+
+
 def test_sentinel_finding_embed():
     event = {
         "event_id": 42, "type": "sentinel_finding", "severity": "high",
