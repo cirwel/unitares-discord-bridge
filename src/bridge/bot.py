@@ -8,7 +8,7 @@ from discord.ext import commands
 
 from bridge.config import (
     DISCORD_TOKEN, GUILD_ID, GOVERNANCE_URL, ANIMA_URL,
-    GOVERNANCE_TOKEN, ANIMA_TOKEN,
+    GOVERNANCE_TOKEN, ANIMA_TOKEN, GOVERNANCE_OPERATOR_TOKEN,
     EVENT_POLL_INTERVAL, HUD_UPDATE_INTERVAL, SENSOR_POLL_INTERVAL, DB_PATH,
     CLASS_ROUTING_ENABLED, LEASE_PLANE_PHASE_B_CHANNEL_ID,
     RESIDENT_FINDING_CHANNELS, SYNC_CHANNEL_TOPICS,
@@ -49,7 +49,11 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = BridgeBot(command_prefix="!", intents=intents)
 
-gov_client = GovernanceClient(GOVERNANCE_URL, token=GOVERNANCE_TOKEN)
+gov_client = GovernanceClient(
+    GOVERNANCE_URL,
+    token=GOVERNANCE_TOKEN,
+    operator_token=GOVERNANCE_OPERATOR_TOKEN,
+)
 anima_client = AnimaClient(ANIMA_URL, token=ANIMA_TOKEN)
 
 cache: BridgeCache | None = None

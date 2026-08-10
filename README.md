@@ -40,6 +40,13 @@ Copy `.env.example` to `.env` and set:
 
 Optional: `GOVERNANCE_API_TOKEN`, `ANIMA_API_TOKEN` for authenticated MCP calls.
 
+`GOVERNANCE_OPERATOR_TOKEN` is separate from `GOVERNANCE_API_TOKEN` and is sent
+as the `X-Unitares-Operator` header. It is what the **live HUD needs to show
+EISV at all**: governance redacts other agents' UUIDs from `list_agents` for
+non-operator callers and substitutes a display handle, and a display handle is
+not a valid `agent_id` for `get_governance_metrics`. Without the operator token
+the HUD lists agents but reports "no state" for every one of them.
+
 ### Resident channels
 
 Findings are routed by their author. Residents listed in

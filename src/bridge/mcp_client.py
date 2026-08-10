@@ -39,15 +39,21 @@ class GovernanceClient:
     and passed as ``parent_agent_id`` on the next start.
     """
 
-    def __init__(self, base_url: str, token: str = ""):
+    def __init__(self, base_url: str, token: str = "", operator_token: str = ""):
         self.base_url = base_url.rstrip("/")
         self.consecutive_failures = 0
         self.agent_uuid: str | None = None
         self.client_session_id: str | None = None
+        self.is_operator = bool(operator_token)
         self._client: httpx.AsyncClient | None = None
         self._headers: dict[str, str] = {}
         if token:
             self._headers["Authorization"] = f"Bearer {token}"
+        if operator_token:
+            # Operator tier is a separate header from bearer auth, and only
+            # this one lifts UUID redaction on list_agents. Sending the
+            # operator token as a bearer does nothing.
+            self._headers["X-Unitares-Operator"] = operator_token
 
     async def open(self) -> None:
         """Create the persistent HTTP client."""
@@ -323,17 +329,32 @@ async def fetch_agents(gov_client: "GovernanceClient") -> list[dict]:
             reverse=True,
         )
         agents = []
+        redacted = 0
         for item in items:
             # Governance redacts UUIDs for non-operator callers
-            # (KG 2026-04-20T00:57:45). Skip rows without a usable id —
-            # passing "" downstream silently fires
-            # get_governance_metrics(agent_id="") and produces a HUD with
-            # labels but no EISV state.
+            # (KG 2026-04-20T00:57:45) and substitutes a display handle
+            # like "Claude_Code_<date>_<uuid8>". The handle is NOT a valid
+            # agent_id: get_governance_metrics resolves against the UUID and
+            # will not match it. Round-tripping it produced the 2026-08-10
+            # HUD-of-seed-values incident — 50 agents at a constant
+            # E=0.70 I=0.80 S=0.20 V=0.00. Count them so a missing operator
+            # token is visible in the log instead of silently degrading.
+            if item.get("uuid_redacted"):
+                redacted += 1
             agent_id = item.get("agent_id") or item.get("id")
             if not agent_id:
+                # Skip rows without a usable id — passing "" downstream
+                # silently fires get_governance_metrics(agent_id="").
                 continue
             label = item.get("label") or item.get("name") or agent_id
             agents.append({"id": agent_id, "label": label})
+        if redacted:
+            log.warning(
+                "list_agents redacted %d/%d agent UUIDs — HUD cannot read EISV "
+                "for these. Set GOVERNANCE_OPERATOR_TOKEN (sent as "
+                "X-Unitares-Operator) to receive real UUIDs.",
+                redacted, len(items),
+            )
         return agents
     except (json.JSONDecodeError, TypeError, KeyError) as exc:
         log.warning("Failed to parse list_agents: %s", exc)
@@ -369,6 +390,17 @@ async def fetch_metrics(
             data = parse_tool_result(result)
             if isinstance(data, list):
                 data = data[0] if data else {}
+            if isinstance(data, dict) and data.get("success") is False:
+                # An unresolvable agent_id now refuses instead of answering
+                # with the ODE seed vector (governance `unknown_agent`).
+                # Drop it rather than rendering it: DEFAULT_METRICS in the
+                # HUD is visibly zero, whereas a seed vector is not visibly
+                # anything.
+                log.warning(
+                    "metrics unavailable for %s: %s (%s)",
+                    agent_id, data.get("error"), data.get("error_type"),
+                )
+                continue
             metrics[agent_id] = {
                 "E": _scalar(data.get("E", data.get("entropy", 0.0))),
                 "I": _scalar(data.get("I", data.get("integration", 0.0))),
