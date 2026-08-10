@@ -16,7 +16,7 @@ CHANNEL_STRUCTURE: dict[str, dict[str, dict[str, str]]] = {
         "activity": {"type": "text", "topic": "Routine agent activity — onboards, idle, lifecycle_created/resumed/archived, knowledge writes"},
         "signals": {"type": "text", "topic": "Operator attention — verdict changes, drift, risk, identity assurance, circuit breakers, confidence clamps"},
         "alerts": {"type": "text", "topic": "Critical only — pause, reject, stuck, silent critical, circuit breaker trip"},
-        "residents": {"type": "text", "topic": "Resident findings without a channel of their own"},
+        "residents": {"type": "text", "topic": "Resident findings without a channel of their own — Vigil, Watcher, and any new resident"},
         "governance-hud": {"type": "text", "topic": "Auto-updating system status"},
     },
     "LUMEN": {
@@ -128,10 +128,36 @@ def build_channel_structure(
     return structure
 
 
+async def _sync_topic(
+    channel: discord.abc.GuildChannel,
+    desired: str,
+    category_name: str,
+) -> None:
+    """Rewrite *channel*'s topic when it has drifted from the declared one.
+
+    Topics are only set at creation, so a channel that predates a wording
+    change keeps describing a job it no longer does — #residents still read
+    "Sentinel / Vigil / Watcher findings" after Sentinel moved out. Best-effort:
+    a cosmetic edit must never abort startup, so a missing Manage Channels
+    permission is logged and skipped.
+    """
+    if not desired or getattr(channel, "topic", None) == desired:
+        return
+    try:
+        await channel.edit(topic=desired)
+        log.info("Updated topic: %s/%s", category_name, channel.name)
+    except Exception as exc:  # noqa: BLE001 — startup must not hinge on a topic
+        log.warning(
+            "Could not update topic for %s/%s: %s",
+            category_name, channel.name, exc,
+        )
+
+
 async def ensure_server_structure(
     guild: discord.Guild,
     taxonomy: dict | None = None,
     resident_channels: Iterable[str] = (),
+    sync_topics: bool = True,
 ) -> dict[str, discord.abc.GuildChannel]:
     """Ensure all required roles, categories, and channels exist in *guild*.
 
@@ -146,6 +172,11 @@ async def ensure_server_structure(
     ``resident_channels`` names the residents that get their own findings
     channel in ``GOVERNANCE`` (e.g. ``("sentinel", "doctor")``); the default
     empty tuple leaves every resident on the shared ``#residents`` feed.
+
+    With ``sync_topics`` (the default), a channel that already exists has its
+    topic brought back in line with the declared structure — otherwise a topic
+    is frozen at whatever it said the day the channel was created. Pass False
+    to leave hand-edited topics alone.
     """
 
     # ---- Roles -------------------------------------------------------------
@@ -175,9 +206,9 @@ async def ensure_server_structure(
 
         for ch_name, ch_cfg in channels.items():
             channel = existing_channels.get(ch_name)
+            topic = ch_cfg.get("topic", "")
             if channel is None:
                 ch_type = ch_cfg["type"]
-                topic = ch_cfg.get("topic", "")
                 if ch_type == "forum":
                     channel = await guild.create_forum(
                         name=ch_name, category=category, topic=topic,
@@ -188,6 +219,8 @@ async def ensure_server_structure(
                         name=ch_name, category=category, topic=topic,
                     )
                     log.info("Created text channel: %s/%s", category_name, ch_name)
+            elif sync_topics:
+                await _sync_topic(channel, topic, category_name)
 
             channel_map[ch_name] = channel
 
