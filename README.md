@@ -48,6 +48,12 @@ channel of their own in the `GOVERNANCE` category, created on startup; every
 other resident's findings keep landing in the shared `#residents` feed. Set the
 variable to an empty string to put everyone back on `#residents`.
 
+Channel topics are declared in code and reconciled on every startup, so a
+channel whose job changes stops advertising the old one. Set
+`BRIDGE_SYNC_CHANNEL_TOPICS=false` to keep hand-edited topics instead. The bot
+needs Manage Channels to rewrite a topic; without it the edit is logged and
+skipped.
+
 ## Run
 
 ```bash

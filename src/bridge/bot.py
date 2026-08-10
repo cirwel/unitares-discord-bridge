@@ -11,7 +11,7 @@ from bridge.config import (
     GOVERNANCE_TOKEN, ANIMA_TOKEN,
     EVENT_POLL_INTERVAL, HUD_UPDATE_INTERVAL, SENSOR_POLL_INTERVAL, DB_PATH,
     CLASS_ROUTING_ENABLED, LEASE_PLANE_PHASE_B_CHANNEL_ID,
-    RESIDENT_FINDING_CHANNELS,
+    RESIDENT_FINDING_CHANNELS, SYNC_CHANNEL_TOPICS,
     DIGEST_ENABLED, DIGEST_INTERVAL, DIGEST_WINDOW, DIGEST_CHECK_INTERVAL,
     DIGEST_RELATIONAL_THRESHOLD,
 )
@@ -108,6 +108,7 @@ async def on_ready():
         guild,
         taxonomy=taxonomy,
         resident_channels=RESIDENT_FINDING_CHANNELS,
+        sync_topics=SYNC_CHANNEL_TOPICS,
     )
     log.info("Server structure ready: %d channels", len(channels))
 

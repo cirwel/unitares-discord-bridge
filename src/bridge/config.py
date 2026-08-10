@@ -95,6 +95,15 @@ RESIDENT_FINDING_CHANNELS: tuple[str, ...] = tuple(
     )
 )
 
+# Channel topics are otherwise frozen at creation time, so a channel whose job
+# changed keeps advertising the old one (#residents still read "Sentinel /
+# Vigil / Watcher findings" after Sentinel got its own channel). When enabled,
+# startup rewrites any bridge-managed topic that has drifted from the declared
+# structure. Turn off to keep hand-edited topics.
+SYNC_CHANNEL_TOPICS = os.environ.get(
+    "BRIDGE_SYNC_CHANNEL_TOPICS", "true"
+).lower() in ("1", "true", "yes", "on")
+
 # Per-class routing — when enabled, broadcaster events that map to a
 # violation class (via /v1/taxonomy reverse-lookup) are mirrored to a
 # class-specific text channel in addition to the main #events channel.
