@@ -12,6 +12,16 @@ ANIMA_URL = os.environ.get("ANIMA_MCP_URL", "")
 GOVERNANCE_TOKEN = os.environ.get("GOVERNANCE_API_TOKEN", "")
 ANIMA_TOKEN = os.environ.get("ANIMA_API_TOKEN", "")
 
+# Operator-tier token, sent as the X-Unitares-Operator header. Distinct from
+# GOVERNANCE_API_TOKEN (bearer auth): governance redacts every other agent's
+# UUID from list_agents for non-operator callers and substitutes a display
+# handle, and a display handle is not a valid agent_id for
+# get_governance_metrics. Without this the HUD can name agents but can never
+# read their state. The bridge is one of the clients this tier was introduced
+# for (see src/mcp_handlers/identity/operator.py upstream). Unset → the HUD
+# degrades loudly rather than silently: see hud.py.
+GOVERNANCE_OPERATOR_TOKEN = os.environ.get("GOVERNANCE_OPERATOR_TOKEN", "")
+
 EVENT_POLL_INTERVAL = int(os.environ.get("EVENT_POLL_INTERVAL", "10"))
 HUD_UPDATE_INTERVAL = int(os.environ.get("HUD_UPDATE_INTERVAL", "30"))
 SENSOR_POLL_INTERVAL = int(os.environ.get("SENSOR_POLL_INTERVAL", "300"))

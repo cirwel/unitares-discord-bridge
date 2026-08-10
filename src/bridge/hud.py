@@ -21,6 +21,15 @@ VERDICT_EMOJI = {
     "reject": "\u26d4",        # no entry
 }
 
+NO_STATE_EMOJI = "⚪"  # white circle
+
+# Historical shape, retained for callers that still pass an explicit default.
+# The HUD itself no longer substitutes it: an agent with no metrics renders as
+# "no state", not as four zeros. Rendering a placeholder vector in the same
+# columns as a real reading is what made the 2026-08-10 incident invisible —
+# 50 agents sat at a constant E=0.70 I=0.80 S=0.20 V=0.00 (the governance ODE
+# seed, returned because the HUD was querying redacted display handles that
+# resolved to no agent) and it read as "quiet fleet" rather than "broken join".
 DEFAULT_METRICS = {"E": 0.0, "I": 0.0, "S": 0.0, "V": 0.0, "verdict": "guide"}
 
 
@@ -60,11 +69,20 @@ def build_hud_embed(
     lines: list[str] = []
     paused = 0
     boundary = 0
+    no_state = 0
 
     for agent in agents:
         agent_id = agent["id"]
         label = agent["label"]
-        m = metrics.get(agent_id, DEFAULT_METRICS)
+        m = metrics.get(agent_id)
+
+        if m is None:
+            # No reading. Say so. Printing zeros here would put a fabricated
+            # vector in the same columns as a measured one.
+            no_state += 1
+            lines.append(f"{NO_STATE_EMOJI} **{label}**  no state")
+            continue
+
         verdict = m.get("verdict", "guide")
         emoji = VERDICT_EMOJI.get(verdict, "\u2753")
 
@@ -85,9 +103,10 @@ def build_hud_embed(
 
     embed.description = "\n".join(lines)
     now = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-    embed.set_footer(
-        text=f"{conn_line}{len(agents)} agents | {paused} paused | {boundary} boundary | Updated {now}"
-    )
+    footer = f"{conn_line}{len(agents)} agents | {paused} paused | {boundary} boundary"
+    if no_state:
+        footer += f" | {no_state} no state"
+    embed.set_footer(text=f"{footer} | Updated {now}")
     return embed
 
 
