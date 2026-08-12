@@ -10,6 +10,7 @@ from bridge.config import (
     DISCORD_TOKEN, GUILD_ID, GOVERNANCE_URL, ANIMA_URL,
     GOVERNANCE_TOKEN, ANIMA_TOKEN, GOVERNANCE_OPERATOR_TOKEN,
     EVENT_POLL_INTERVAL, HUD_UPDATE_INTERVAL, SENSOR_POLL_INTERVAL, DB_PATH,
+    SELF_ITERATION_ENABLED, SELF_ITERATION_POLL_INTERVAL,
     CLASS_ROUTING_ENABLED, LEASE_PLANE_PHASE_B_CHANNEL_ID,
     RESIDENT_FINDING_CHANNELS, SYNC_CHANNEL_TOPICS,
     DIGEST_ENABLED, DIGEST_INTERVAL, DIGEST_WINDOW, DIGEST_CHECK_INTERVAL,
@@ -21,6 +22,7 @@ from bridge.server_setup import ensure_server_structure
 from bridge.event_poller import EventPoller
 from bridge.hud import HUDUpdater
 from bridge.lumen import LumenPoller
+from bridge.iterations import LumenIterationPoller
 from bridge.digest import LumenDigestPoller
 from bridge.acks import setup_acks
 from bridge.commands import setup_commands
@@ -61,6 +63,7 @@ event_poller: EventPoller | None = None
 ws_subscriber: WSEventSubscriber | None = None
 hud_updater: HUDUpdater | None = None
 lumen_poller: LumenPoller | None = None
+iteration_poller: LumenIterationPoller | None = None
 digest_poller: LumenDigestPoller | None = None
 audit_channel: discord.TextChannel | None = None
 _initialized: bool = False
@@ -68,7 +71,7 @@ _initialized: bool = False
 
 @bot.event
 async def on_ready():
-    global cache, event_poller, ws_subscriber, hud_updater, lumen_poller, digest_poller, audit_channel, _initialized
+    global cache, event_poller, ws_subscriber, hud_updater, lumen_poller, iteration_poller, digest_poller, audit_channel, _initialized
 
     if _initialized:
         log.info("Reconnected as %s (skipping re-init)", bot.user)
@@ -224,6 +227,22 @@ async def on_ready():
         await lumen_poller.start()
         log.info("Lumen poller started")
 
+    # Surface Anima's read-only self-iteration attention projection. Discord
+    # acknowledgement is delivery metadata only and never a review signature.
+    iterations_ch = channels.get("lumen-iterations")
+    if SELF_ITERATION_ENABLED and iterations_ch and cache is not None:
+        iteration_poller = LumenIterationPoller(
+            anima_client,
+            gov_client,
+            cache,
+            iterations_ch,
+            signals_ch,
+            alerts_ch,
+            SELF_ITERATION_POLL_INTERVAL,
+        )
+        await iteration_poller.start()
+        log.info("Lumen self-iteration attention poller started")
+
     # Start the Lumen Q&A digest if enabled and its channel exists
     digest_ch = channels.get("lumen-digest")
     if DIGEST_ENABLED and digest_ch and cache is not None:
@@ -246,7 +265,7 @@ async def on_ready():
 
     # Post startup message to audit log
     if audit_channel:
-        active = [n for n, c in [("events", event_poller), ("ws", ws_subscriber), ("HUD", hud_updater), ("Lumen", lumen_poller), ("digest", digest_poller)] if c]
+        active = [n for n, c in [("events", event_poller), ("ws", ws_subscriber), ("HUD", hud_updater), ("Lumen", lumen_poller), ("iterations", iteration_poller), ("digest", digest_poller)] if c]
         embed = discord.Embed(
             title="Bridge Online",
             description=f"Systems active: {', '.join(active) or 'none'}",
@@ -265,7 +284,7 @@ async def on_ready():
 
 async def shutdown_bridge() -> None:
     """Graceful shutdown: stop all background tasks and close the cache."""
-    global cache, event_poller, ws_subscriber, hud_updater, lumen_poller, digest_poller, audit_channel, _initialized
+    global cache, event_poller, ws_subscriber, hud_updater, lumen_poller, iteration_poller, digest_poller, audit_channel, _initialized
     log.info("Shutting down bridge...")
 
     # Post shutdown message while connection is still alive
@@ -287,6 +306,7 @@ async def shutdown_bridge() -> None:
         ("ws_subscriber", ws_subscriber),
         ("hud_updater", hud_updater),
         ("lumen_poller", lumen_poller),
+        ("iteration_poller", iteration_poller),
         ("digest_poller", digest_poller),
     ]:
         if component is not None:
@@ -313,6 +333,7 @@ async def shutdown_bridge() -> None:
     ws_subscriber = None
     hud_updater = None
     lumen_poller = None
+    iteration_poller = None
     digest_poller = None
     audit_channel = None
     _initialized = False

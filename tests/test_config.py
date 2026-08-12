@@ -46,3 +46,29 @@ def test_resident_finding_channels_can_be_disabled(monkeypatch):
     finally:
         monkeypatch.delenv("BRIDGE_RESIDENT_FINDING_CHANNELS", raising=False)
         importlib.reload(config)
+
+
+def test_self_iteration_attention_defaults_enabled(monkeypatch):
+    monkeypatch.delenv("LUMEN_SELF_ITERATION_ENABLED", raising=False)
+    monkeypatch.delenv("LUMEN_SELF_ITERATION_POLL_INTERVAL", raising=False)
+    try:
+        reloaded = importlib.reload(config)
+        assert reloaded.SELF_ITERATION_ENABLED is True
+        assert reloaded.SELF_ITERATION_POLL_INTERVAL == 60
+    finally:
+        importlib.reload(config)
+
+
+def test_self_iteration_attention_can_be_configured(monkeypatch):
+    try:
+        reloaded = _reload_with(
+            monkeypatch,
+            LUMEN_SELF_ITERATION_ENABLED="false",
+            LUMEN_SELF_ITERATION_POLL_INTERVAL="15",
+        )
+        assert reloaded.SELF_ITERATION_ENABLED is False
+        assert reloaded.SELF_ITERATION_POLL_INTERVAL == 15
+    finally:
+        monkeypatch.delenv("LUMEN_SELF_ITERATION_ENABLED", raising=False)
+        monkeypatch.delenv("LUMEN_SELF_ITERATION_POLL_INTERVAL", raising=False)
+        importlib.reload(config)

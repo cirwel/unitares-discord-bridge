@@ -25,6 +25,12 @@ GOVERNANCE_OPERATOR_TOKEN = os.environ.get("GOVERNANCE_OPERATOR_TOKEN", "")
 EVENT_POLL_INTERVAL = int(os.environ.get("EVENT_POLL_INTERVAL", "10"))
 HUD_UPDATE_INTERVAL = int(os.environ.get("HUD_UPDATE_INTERVAL", "30"))
 SENSOR_POLL_INTERVAL = int(os.environ.get("SENSOR_POLL_INTERVAL", "300"))
+SELF_ITERATION_POLL_INTERVAL = int(
+    os.environ.get("LUMEN_SELF_ITERATION_POLL_INTERVAL", "60")
+)
+SELF_ITERATION_ENABLED = os.environ.get(
+    "LUMEN_SELF_ITERATION_ENABLED", "true"
+).lower() in ("1", "true", "yes", "on")
 
 # Reaction(s) that count as acknowledging a delivered event. Comma-separated so
 # a deployment can accept more than one gesture. Kept to an explicit set rather

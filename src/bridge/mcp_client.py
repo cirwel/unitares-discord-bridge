@@ -529,3 +529,41 @@ class AnimaClient:
         finally:
             if self._client is None:
                 await client.aclose()
+
+    async def fetch_self_iteration_attention(self, limit: int = 50) -> dict | None:
+        """Read Anima's bounded, non-authoritative attention projection.
+
+        The projection is fetched through the existing authenticated REST tool
+        adapter. Only the read-only ``attention`` action is used; this client
+        never submits signatures or invokes an approval-consuming action.
+        """
+        client = self._get_client()
+        try:
+            resp = await client.post(
+                "/v1/tools/call",
+                json={
+                    "name": "self_iteration",
+                    "arguments": {"action": "attention", "limit": limit},
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            result = data.get("result") if isinstance(data, dict) else None
+            if (
+                not isinstance(data, dict)
+                or data.get("success") is not True
+                or not isinstance(result, dict)
+                or result.get("schema") != "anima.self_iteration.attention.v1"
+                or not isinstance(result.get("items"), list)
+                or result.get("acknowledgement_is_approval") is not False
+                or result.get("authority_granted") is not False
+            ):
+                log.warning("anima self-iteration attention response is unavailable")
+                return None
+            return result
+        except Exception as exc:
+            log.warning("anima fetch_self_iteration_attention failed: %s", exc)
+            return None
+        finally:
+            if self._client is None:
+                await client.aclose()
