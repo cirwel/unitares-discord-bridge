@@ -10,6 +10,7 @@ Discord bot that surfaces UNITARES governance events and Lumen state in Discord.
 
 - **Governance events** — Check-ins, verdicts, dialectic sessions
 - **Lumen state** — Sensor readings, creature status from the embodied agent
+- **Lumen self-iteration** — Provenance-labeled proposal/review/canary attention with critical recovery routing
 - **HUD updates** — Live status channels
 - **Slash commands** — Status, health, resume, and Lumen snapshots
 
@@ -39,6 +40,20 @@ Copy `.env.example` to `.env` and set:
 | `ANIMA_MCP_URL` | Anima/Lumen MCP URL (optional) |
 
 Optional: `GOVERNANCE_API_TOKEN`, `ANIMA_API_TOKEN` for authenticated MCP calls.
+
+Self-iteration attention is enabled by default. The bridge polls Anima's
+read-only `self_iteration(action="attention")` projection every 60 seconds,
+posts each stable record once to `#lumen-iterations`, mirrors review-ready
+records to `#signals`, and mirrors recovery-critical records to `#alerts`.
+Configure `LUMEN_SELF_ITERATION_ENABLED=false` to disable it or
+`LUMEN_SELF_ITERATION_POLL_INTERVAL` to change the cadence. A ✅ reaction is a
+delivery acknowledgement only; it never satisfies Anima's distinct signed
+review requirements.
+
+Each post preserves Anima's epistemic distinction: proposal source labels are
+shown as caller claims, request provenance is not presented as claim truth, and
+independent verification status and effective policy weight are displayed
+separately.
 
 `GOVERNANCE_OPERATOR_TOKEN` is separate from `GOVERNANCE_API_TOKEN` and is sent
 as the `X-Unitares-Operator` header. It is what the **live HUD needs to show

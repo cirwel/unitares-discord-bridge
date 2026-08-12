@@ -22,6 +22,7 @@ CHANNEL_STRUCTURE: dict[str, dict[str, dict[str, str]]] = {
     "LUMEN": {
         "lumen-art": {"type": "text", "topic": "Lumen's drawings"},
         "lumen-sensors": {"type": "text", "topic": "Environmental sensor readings"},
+        "lumen-iterations": {"type": "text", "topic": "Read-only self-iteration proposals, reviews, canaries, and recovery attention"},
         "lumen-digest": {"type": "text", "topic": "Weekly Q&A digest — what Lumen wondered about, and when to visit live"},
     },
     "CONTROL": {

@@ -212,6 +212,63 @@ async def test_anima_fetch_drawing_image_error():
     assert result is None
 
 
+@pytest.mark.asyncio
+async def test_anima_fetch_self_iteration_attention():
+    attention = {
+        "schema": "anima.self_iteration.attention.v1",
+        "items": [{"attention_id": "si-attn-" + "a" * 24}],
+        "acknowledgement_is_approval": False,
+        "authority_granted": False,
+    }
+    resp = make_mock_response(json_data={"success": True, "result": attention})
+
+    with mock_httpx_client("post", resp) as mock_cls:
+        client = AnimaClient("http://localhost:8766")
+        result = await client.fetch_self_iteration_attention(limit=20)
+
+    assert result == attention
+    posted = mock_cls.return_value.post.await_args
+    assert posted.args[0] == "/v1/tools/call"
+    assert posted.kwargs["json"] == {
+        "name": "self_iteration",
+        "arguments": {"action": "attention", "limit": 20},
+    }
+
+
+@pytest.mark.asyncio
+async def test_anima_fetch_self_iteration_attention_rejects_wrong_schema():
+    resp = make_mock_response(
+        json_data={"success": True, "result": {"schema": "caller.claim", "items": []}}
+    )
+
+    with mock_httpx_client("post", resp):
+        client = AnimaClient("http://localhost:8766")
+        result = await client.fetch_self_iteration_attention()
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_anima_fetch_self_iteration_attention_rejects_authority_confusion():
+    resp = make_mock_response(
+        json_data={
+            "success": True,
+            "result": {
+                "schema": "anima.self_iteration.attention.v1",
+                "items": [],
+                "acknowledgement_is_approval": True,
+                "authority_granted": False,
+            },
+        }
+    )
+
+    with mock_httpx_client("post", resp):
+        client = AnimaClient("http://localhost:8766")
+        result = await client.fetch_self_iteration_attention()
+
+    assert result is None
+
+
 # --- Lifecycle tests ---
 
 @pytest.mark.asyncio

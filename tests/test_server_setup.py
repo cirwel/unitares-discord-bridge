@@ -21,6 +21,12 @@ def test_default_structure_has_no_resident_channels():
     assert "VIOLATIONS" not in structure
 
 
+def test_lumen_structure_has_self_iteration_attention_channel():
+    channel = CHANNEL_STRUCTURE["LUMEN"]["lumen-iterations"]
+    assert channel["type"] == "text"
+    assert "self-iteration" in channel["topic"]
+
+
 def test_resident_channels_are_created_next_to_residents():
     structure = build_channel_structure(resident_channels=("sentinel", "doctor"))
     names = list(_governance(structure))
