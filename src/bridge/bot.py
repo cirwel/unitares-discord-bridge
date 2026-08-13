@@ -14,7 +14,7 @@ from bridge.config import (
     CLASS_ROUTING_ENABLED, LEASE_PLANE_PHASE_B_CHANNEL_ID,
     RESIDENT_FINDING_CHANNELS, SYNC_CHANNEL_TOPICS,
     DIGEST_ENABLED, DIGEST_INTERVAL, DIGEST_WINDOW, DIGEST_CHECK_INTERVAL,
-    DIGEST_RELATIONAL_THRESHOLD,
+    DIGEST_RELATIONAL_THRESHOLD, LUMEN_OFFLINE_MENTION,
 )
 from bridge.cache import BridgeCache
 from bridge.mcp_client import GovernanceClient, AnimaClient
@@ -223,6 +223,7 @@ async def on_ready():
     if art_ch and sensor_ch:
         lumen_poller = LumenPoller(
             anima_client, art_ch, sensor_ch, SENSOR_POLL_INTERVAL,
+            offline_mention=LUMEN_OFFLINE_MENTION,
         )
         await lumen_poller.start()
         log.info("Lumen poller started")

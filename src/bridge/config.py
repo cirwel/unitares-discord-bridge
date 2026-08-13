@@ -22,6 +22,20 @@ ANIMA_TOKEN = os.environ.get("ANIMA_API_TOKEN", "")
 # degrades loudly rather than silently: see hud.py.
 GOVERNANCE_OPERATOR_TOKEN = os.environ.get("GOVERNANCE_OPERATOR_TOKEN", "")
 
+# Mention prefixed to the "Lumen Offline" / "Lumen Online" posts ONLY — e.g.
+# "<@123456789>" for a user or "<@&987654321>" for a role. Empty (the default)
+# keeps the current behaviour and the repo user-agnostic.
+#
+# Every other surface in this bridge is deliberately silent: routine embeds and
+# self-iteration attention items post without pinging (iterations.py). That is
+# right for a status feed and wrong for an outage. Lumen went dark for ~3.5 days
+# in July 2026 while the Pi was unplugged; the bridge detected it correctly and
+# posted an embed nobody was looking at, so the outage was found by hand on the
+# operator's return. A channel post is a record, not an alert — only a mention
+# reaches a phone. Scoped to the offline/recovery transitions (which fire at most
+# twice per outage) so this cannot become a notification firehose.
+LUMEN_OFFLINE_MENTION = os.environ.get("LUMEN_OFFLINE_MENTION", "").strip()
+
 EVENT_POLL_INTERVAL = int(os.environ.get("EVENT_POLL_INTERVAL", "10"))
 HUD_UPDATE_INTERVAL = int(os.environ.get("HUD_UPDATE_INTERVAL", "30"))
 SENSOR_POLL_INTERVAL = int(os.environ.get("SENSOR_POLL_INTERVAL", "300"))
