@@ -162,3 +162,88 @@ async def test_sensor_loop_failure_counter_resets_on_success():
     await poller._sensor_tick()  # fail (count=1, not 2)
 
     assert poller._was_offline is False
+
+
+# ---------------------------------------------------------------------------
+# Outage alerts must actually notify
+# ---------------------------------------------------------------------------
+#
+# The bridge detected the July 2026 outage correctly and posted an embed nobody
+# was looking at. A channel post is a record; only a mention reaches a phone.
+
+
+def _make_poller_with_mention(mention="<@&999>"):
+    anima = AsyncMock()
+    art_ch = AsyncMock(spec=discord.TextChannel)
+    sensor_ch = AsyncMock(spec=discord.TextChannel)
+    poller = LumenPoller(
+        anima, art_ch, sensor_ch, sensor_interval=0, offline_mention=mention
+    )
+    return poller, anima, sensor_ch
+
+
+async def _drive_offline(poller, anima):
+    anima.fetch_state = AsyncMock(return_value=None)
+    await poller._sensor_tick()
+    await poller._sensor_tick()
+
+
+@pytest.mark.asyncio
+async def test_offline_post_carries_the_configured_mention():
+    poller, anima, sensor_ch = _make_poller_with_mention()
+    await _drive_offline(poller, anima)
+
+    assert poller._was_offline is True
+    kwargs = sensor_ch.send.call_args.kwargs
+    assert kwargs["content"] == "<@&999>"
+    assert kwargs["allowed_mentions"].everyone is False
+    assert kwargs["allowed_mentions"].roles is True
+
+
+@pytest.mark.asyncio
+async def test_recovery_post_carries_the_mention_too():
+    """Whoever was woken by the outage should not have to poll to learn it ended."""
+    poller, anima, sensor_ch = _make_poller_with_mention()
+    await _drive_offline(poller, anima)
+    sensor_ch.send.reset_mock()
+
+    anima.fetch_state = AsyncMock(return_value=SAMPLE_STATE)
+    sensor_ch.send = AsyncMock(return_value=AsyncMock(spec=discord.Message))
+    await poller._sensor_tick()
+
+    assert poller._was_offline is False
+    assert sensor_ch.send.call_args_list[0].kwargs["content"] == "<@&999>"
+
+
+@pytest.mark.asyncio
+async def test_routine_sensor_post_is_never_mentioned():
+    """Only the offline/recovery transitions ping. A status feed must stay silent."""
+    poller, anima, sensor_ch = _make_poller_with_mention()
+    anima.fetch_state = AsyncMock(return_value=SAMPLE_STATE)
+    sensor_ch.send = AsyncMock(return_value=AsyncMock(spec=discord.Message))
+
+    await poller._sensor_tick()
+
+    assert "content" not in sensor_ch.send.call_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_unset_mention_keeps_todays_silent_behaviour():
+    poller, anima, sensor_ch = _make_poller_with_mention(mention="")
+    await _drive_offline(poller, anima)
+
+    assert poller._was_offline is True
+    assert "content" not in sensor_ch.send.call_args.kwargs
+    assert "allowed_mentions" not in sensor_ch.send.call_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_debounce_still_holds_with_a_mention_configured():
+    """A single transient blip must not page anyone."""
+    poller, anima, sensor_ch = _make_poller_with_mention()
+    anima.fetch_state = AsyncMock(return_value=None)
+
+    await poller._sensor_tick()
+
+    assert poller._was_offline is False
+    sensor_ch.send.assert_not_called()

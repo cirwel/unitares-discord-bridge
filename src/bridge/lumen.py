@@ -73,11 +73,16 @@ class LumenPoller:
         sensor_channel: discord.TextChannel,
         sensor_interval: int = 300,
         offline_threshold: int = 2,
+        offline_mention: str = "",
     ) -> None:
         self.anima = anima_client
         self.art_channel = art_channel
         self.sensor_channel = sensor_channel
         self.sensor_interval = sensor_interval
+        # Prefixed to the offline/recovery posts so they actually notify. A bare
+        # embed in a channel is a record, not an alert (see config
+        # LUMEN_OFFLINE_MENTION). Empty → unchanged silent behaviour.
+        self.offline_mention = (offline_mention or "").strip()
         # Require N consecutive failed ticks before announcing offline. A single
         # transient transport blip (cloudflared / IPv6-loopback-proxy stutter)
         # used to flip _was_offline and produce a false "Lumen Offline → Lumen
@@ -106,6 +111,24 @@ class LumenPoller:
         """Cancel both background tasks."""
         await cancel_tasks(self._sensor_task, self._drawing_task)
 
+    def _alert_kwargs(self) -> dict:
+        """send() kwargs that make an outage post actually notify.
+
+        Empty dict when no mention is configured, so the default deployment
+        keeps today's silent behaviour. `allowed_mentions` is set explicitly
+        rather than inherited: it pins @everyone/@here off regardless of any
+        future client-wide default, while still letting the configured user or
+        role through. Only the offline and recovery transitions use this.
+        """
+        if not self.offline_mention:
+            return {}
+        return {
+            "content": self.offline_mention,
+            "allowed_mentions": discord.AllowedMentions(
+                everyone=False, users=True, roles=True
+            ),
+        }
+
     # -- Sensor loop --------------------------------------------------------
 
     async def _sensor_loop(self) -> None:
@@ -130,7 +153,9 @@ class LumenPoller:
                         timestamp=datetime.now(timezone.utc),
                     )
                     embed.description = "Unable to reach Lumen's sensor interface."
-                    await self.sensor_channel.send(embed=embed)
+                    await self.sensor_channel.send(
+                        embed=embed, **self._alert_kwargs()
+                    )
                     self._was_offline = True
                     self._sensor_msg = None
             else:
@@ -142,7 +167,11 @@ class LumenPoller:
                         timestamp=datetime.now(timezone.utc),
                     )
                     recovery.description = "Lumen's sensor interface is reachable again."
-                    await self.sensor_channel.send(embed=recovery)
+                    # Ping the recovery too: whoever got woken by the outage
+                    # should not have to poll Discord to learn it is over.
+                    await self.sensor_channel.send(
+                        embed=recovery, **self._alert_kwargs()
+                    )
                     self._sensor_msg = None
                 self._was_offline = False
                 embed = build_sensor_embed(state)
