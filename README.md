@@ -84,6 +84,10 @@ unitares-bridge
 python -m bridge.bot
 ```
 
+## Agent skill
+
+[`skills/discord-bridge/SKILL.md`](skills/discord-bridge/SKILL.md) is the operating guide for agents that set up or run this bridge. It lived in the UNITARES server's `skills/` until 2026-09-27, where every install served it to every agent; it moved here because it describes this bridge, not the governance server. Its `source_files` are relative to the directory that holds your checkouts (`unitares-discord-bridge/src/...`). Load it into your agent the way you load other local skills.
+
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
