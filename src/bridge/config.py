@@ -14,7 +14,7 @@ ANIMA_TOKEN = os.environ.get("ANIMA_API_TOKEN", "")
 
 # Operator-tier token, sent as the X-Unitares-Operator header. Distinct from
 # GOVERNANCE_API_TOKEN (bearer auth): governance redacts every other agent's
-# UUID from list_agents for non-operator callers and substitutes a display
+# UUID from agent(action="list") for non-operator callers and substitutes a display
 # handle, and a display handle is not a valid agent_id for
 # get_governance_metrics. Without this the HUD can name agents but can never
 # read their state. The bridge is one of the clients this tier was introduced

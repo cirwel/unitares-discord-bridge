@@ -620,7 +620,7 @@ async def test_call_tool_echoes_client_session_id():
     with patch("bridge.mcp_client.httpx.AsyncClient", MagicMock(return_value=mock_client_instance)):
         gov = GovernanceClient("http://localhost:8767")
         gov.client_session_id = "sess-echo"
-        await gov.call_tool("list_agents", {"lite": True})
+        await gov.call_tool("agent", {"action": "list", "lite": True})
 
     sent = mock_client_instance.post.call_args.kwargs["json"]
     assert sent["arguments"]["client_session_id"] == "sess-echo"
@@ -652,7 +652,7 @@ async def test_call_tool_unbound_does_not_inject():
     mock_client_instance.aclose = AsyncMock()
     with patch("bridge.mcp_client.httpx.AsyncClient", MagicMock(return_value=mock_client_instance)):
         gov = GovernanceClient("http://localhost:8767")
-        await gov.call_tool("list_agents", {"lite": True})
+        await gov.call_tool("agent", {"action": "list", "lite": True})
 
     sent = mock_client_instance.post.call_args.kwargs["json"]
     assert "client_session_id" not in sent["arguments"]
