@@ -229,7 +229,8 @@ async def test_fetch_agents_requests_recent_window():
     })
     await _fetch_agents(gov)
     name, args = gov.call_tool.call_args.args
-    assert name == "list_agents"
+    assert name == "agent"
+    assert args.get("action") == "list"
     assert args.get("recent_days") == 7
     assert args.get("lite") is True
 

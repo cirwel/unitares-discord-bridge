@@ -12,7 +12,7 @@ log = logging.getLogger(__name__)
 
 # Mirrors governance's RESERVED_PREFIXES (src/mcp_handlers/validators.py). An
 # agent_id with one of these prefixes is rejected by get_governance_metrics with
-# error_type=reserved_prefix. list_agents redacts UUIDs for non-operator callers
+# error_type=reserved_prefix. agent(action="list") redacts UUIDs for non-operator callers
 # and can hand back a synthesized reserved-prefix human id (e.g. Chronicler's
 # "mcp_<date>_<suffix>"); round-tripping that into a metrics read produces a
 # guaranteed rejection every HUD cycle (~2/min). Skip such ids before firing.
@@ -51,7 +51,7 @@ class GovernanceClient:
             self._headers["Authorization"] = f"Bearer {token}"
         if operator_token:
             # Operator tier is a separate header from bearer auth, and only
-            # this one lifts UUID redaction on list_agents. Sending the
+            # this one lifts UUID redaction on agent(action="list"). Sending the
             # operator token as a bearer does nothing.
             self._headers["X-Unitares-Operator"] = operator_token
 
@@ -315,7 +315,7 @@ def _derive_verdict(data: dict) -> str:
 
 
 async def fetch_agents(gov_client: "GovernanceClient") -> list[dict]:
-    """Call list_agents and return normalised list of {"id": ..., "label": ...}.
+    """Call agent(action="list") and return normalised list of {"id": ..., "label": ...}.
 
     Sorted by last activity descending (most-recent first). Test agents are
     filtered out by governance's lite mode; we widen the window and re-sort
@@ -323,8 +323,8 @@ async def fetch_agents(gov_client: "GovernanceClient") -> list[dict]:
     high-update ones.
     """
     result = await gov_client.call_tool(
-        "list_agents",
-        {"lite": True, "limit": 50, "recent_days": 7},
+        "agent",
+        {"action": "list", "lite": True, "limit": 50, "recent_days": 7},
     )
     if result is None:
         return []
@@ -363,14 +363,14 @@ async def fetch_agents(gov_client: "GovernanceClient") -> list[dict]:
             agents.append({"id": agent_id, "label": label})
         if redacted:
             log.warning(
-                "list_agents redacted %d/%d agent UUIDs — HUD cannot read EISV "
+                "agent(action='list') redacted %d/%d agent UUIDs — HUD cannot read EISV "
                 "for these. Set GOVERNANCE_OPERATOR_TOKEN (sent as "
                 "X-Unitares-Operator) to receive real UUIDs.",
                 redacted, len(items),
             )
         return agents
     except (json.JSONDecodeError, TypeError, KeyError) as exc:
-        log.warning("Failed to parse list_agents: %s", exc)
+        log.warning("Failed to parse agent(action='list'): %s", exc)
         return []
 
 
@@ -388,7 +388,7 @@ async def fetch_metrics(
             continue
         if _is_reserved_agent_id(agent_id):
             # Reserved-prefix ids (e.g. a redacted "mcp_<date>_<suffix>" human
-            # id from list_agents) are rejected by get_governance_metrics with
+            # id from agent(action="list")) are rejected by get_governance_metrics with
             # error_type=reserved_prefix. Firing them anyway logs a guaranteed
             # failure every HUD cycle. The agent still shows in the HUD with its
             # label; it just carries no EISV — same outcome as today, minus the

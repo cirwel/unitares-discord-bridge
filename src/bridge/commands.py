@@ -298,7 +298,7 @@ def setup_commands(
     async def cmd_agent(interaction: discord.Interaction, name: str) -> None:
         await interaction.response.defer()
         try:
-            # observe_agent is case-sensitive on label; resolve via list_agents first
+            # observe(action="agent") is case-sensitive on label; resolve via agent(action="list") first
             resolved = await _resolve_agent_label(gov_client, name)
             if resolved is None:
                 await interaction.followup.send(
@@ -307,7 +307,7 @@ def setup_commands(
                 return
 
             result = await gov_client.call_tool(
-                "observe_agent", {"agent_id": resolved["label"]},
+                "observe", {"action": "agent", "agent_id": resolved["label"]},
             )
             if not result:
                 await interaction.followup.send(
@@ -318,7 +318,7 @@ def setup_commands(
             if isinstance(data, list):
                 data = data[0] if data else {}
 
-            # observe_agent returns {"observation": {"current_state": {E, I, S, V, ...}}}
+            # observe(action="agent") returns {"observation": {"current_state": {E, I, S, V, ...}}}
             state = data.get("observation", {}).get("current_state", {})
             flat = {
                 "label": resolved["label"],
@@ -500,9 +500,9 @@ def _error_embed(message: str) -> discord.Embed:
 async def _resolve_agent_label(
     gov_client: GovernanceClient, query: str,
 ) -> dict | None:
-    """Resolve a user-typed label or id to {"id", "label"} via list_agents.
+    """Resolve a user-typed label or id to {"id", "label"} via agent(action="list").
 
-    observe_agent is case-sensitive on label, so we do the case-insensitive
+    observe(action="agent") is case-sensitive on label, so we do the case-insensitive
     matching ourselves here.
     """
     agents = await fetch_agents(gov_client)
@@ -518,7 +518,7 @@ async def _resolve_agent_label(
 
 
 def _state_to_verdict(state: dict) -> str:
-    """Map an observe_agent current_state dict to a HUD verdict."""
+    """Map an observe(action="agent") current_state dict to a HUD verdict."""
     risk = float(state.get("risk_score", 0.0))
     coherence = float(state.get("coherence", 0.0))
     if risk >= 0.75:
