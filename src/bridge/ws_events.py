@@ -33,7 +33,11 @@ import websockets
 import websockets.exceptions
 
 from bridge import config
-from bridge.embeds import finding_resident_key, is_finding_event
+from bridge.cache import FindingDeliveryCache
+from bridge.embeds import (
+    attention_severity, event_to_embed, finding_resident_key,
+    is_critical_event, is_finding_event,
+)
 from bridge.mcp_client import GovernanceClient
 
 from bridge.tasks import cancel_tasks, create_logged_task
@@ -118,6 +122,11 @@ def broadcaster_event_to_embed(event: dict) -> Optional[discord.Embed]:
     t = event.get("type") or ""
     if not t or t == "eisv_update":
         return None
+    if is_finding_event(event):
+        return event_to_embed({
+            **event,
+            "severity": attention_severity(event, critical=is_critical_broadcaster_event(event)),
+        })
 
     agent_id = event.get("resident_id") or event.get("agent_id") or ""
     short_id = str(agent_id)[:12] if agent_id else ""
@@ -207,6 +216,14 @@ def broadcaster_event_to_embed(event: dict) -> Optional[discord.Embed]:
     embed = discord.Embed(title=title, description=description, colour=colour)
     embed.add_field(name="Agent", value=str(agent), inline=True)
     embed.add_field(name="Type", value=t, inline=True)
+    if is_critical_broadcaster_event(event):
+        embed.add_field(name="Severity", value=attention_severity(event, critical=True), inline=True)
+    if t == "lifecycle_silent_critical":
+        embed.add_field(
+            name="Next check",
+            value="Verify expected cadence and last completed work. Silence alone is not proof of a service outage.",
+            inline=False,
+        )
     if ts:
         embed.set_footer(text=str(ts))
     return embed
@@ -236,6 +253,8 @@ def classify_broadcaster_event(event: dict) -> str:
 
 def is_critical_broadcaster_event(event: dict) -> bool:
     """Also mirror to alerts channel if this fires."""
+    if is_critical_event(event):
+        return True
     t = event.get("type") or ""
     if t == "circuit_breaker_trip":
         return True
@@ -295,9 +314,13 @@ class WSEventSubscriber:
         lease_plane_phase_b_channel: Optional[discord.TextChannel] = None,
         gov_client: Optional[GovernanceClient] = None,
         resident_channels: Optional[dict[str, discord.TextChannel]] = None,
+        residents_channel: Optional[discord.TextChannel] = None,
+        delivery_cache: FindingDeliveryCache | None = None,
     ) -> None:
         self.ws_url = ws_url_from_http(governance_url)
         self.gov = gov_client
+        self.delivery_cache = delivery_cache
+        self.residents_channel = residents_channel
         self.activity_channel = activity_channel
         self.signals_channel = signals_channel
         self.alerts_channel = alerts_channel
@@ -309,7 +332,7 @@ class WSEventSubscriber:
         # Per-resident finding channels: {"sentinel": channel, ...}. A finding
         # from a resident in this map goes to its channel instead of the shared
         # signals feed — the WS twin of the REST poller's routing. Residents
-        # without an entry are unaffected (this path has no #residents feed).
+        # without an entry use the same #residents fallback as REST when wired.
         self.resident_channels = resident_channels or {}
         self.taxonomy_reverse = taxonomy_reverse or {}
         # Operator-managed channel for lease_plane_phase_b_transition events
@@ -426,10 +449,10 @@ class WSEventSubscriber:
 
     def _resident_channel(self, event: dict) -> Optional[discord.TextChannel]:
         """Dedicated channel for this finding's author, if it has one."""
-        if not self.resident_channels or not is_finding_event(event):
+        if not is_finding_event(event):
             return None
         key = finding_resident_key(event)
-        return self.resident_channels.get(key) if key else None
+        return self.resident_channels.get(key) or self.residents_channel
 
     async def _dispatch(self, event: dict) -> None:
         # Record every typed event (including ones we don't turn into an
@@ -545,7 +568,9 @@ class WSEventSubscriber:
             "source_event_id": source_event.get("event_id"),
             "source_event_type": source_event.get("type"),
             "source_agent_id": source_event.get("agent_id"),
-            "source_severity": source_event.get("severity", "info"),
+            "source_severity": attention_severity(
+                source_event, critical=is_critical_broadcaster_event(source_event),
+            ),
         }
         if channel is not None:
             payload.update({
@@ -590,12 +615,17 @@ class WSEventSubscriber:
             except asyncio.CancelledError:
                 raise
             try:
-                message = await channel.send(embed=embed)
+                if getattr(self, "delivery_cache", None) is not None:
+                    message_id, duplicate = await self.delivery_cache.send(channel, embed, source_event)
+                else:
+                    message = await channel.send(embed=embed)
+                    message_id, duplicate = getattr(message, "id", None), False
                 await self._record_receipt(
-                    "bridge.delivery",
+                    "bridge.suppressed" if duplicate else "bridge.delivery",
                     source_event=source_event,
                     channel=channel,
-                    discord_message_id=getattr(message, "id", None),
+                    discord_message_id=message_id,
+                    reason="duplicate_finding_delivery" if duplicate else None,
                 )
             except discord.RateLimited as exc:
                 log.warning("WS events: rate limited, retry in %.1fs",

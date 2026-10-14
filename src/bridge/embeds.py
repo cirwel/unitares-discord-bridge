@@ -99,7 +99,7 @@ def _evidence_line(ev: dict) -> str:
 
 def event_to_embed(event: dict) -> discord.Embed:
     """Convert a governance event dict to a Discord embed."""
-    severity = event.get("severity", "info")
+    severity = attention_severity(event, critical=is_critical_event(event))
     event_type = event.get("type", "unknown")
     colour = SEVERITY_COLOURS.get(severity, discord.Colour.greyple())
     title = EVENT_TITLES.get(event_type, event_type.replace("_", " ").title())
@@ -122,6 +122,11 @@ def event_to_embed(event: dict) -> discord.Embed:
     elif event_type == "risk_threshold":
         embed.add_field(name="Risk", value=f"{_safe_float(event.get('value')):.0%}", inline=True)
         embed.add_field(name="Direction", value=event.get("direction", "?"), inline=True)
+        embed.add_field(
+            name="Interpretation",
+            value="Governance risk signal, not a confirmed service outage. Inspect the named agent and supporting evidence.",
+            inline=False,
+        )
     elif event_type == "drift_alert":
         embed.add_field(name="Axis", value=event.get("axis", "?"), inline=True)
         embed.add_field(name="Value", value=f"{_safe_float(event.get('value')):.2f}", inline=True)
@@ -235,3 +240,15 @@ def is_critical_event(event: dict) -> bool:
     if event.get("type") == "dialectic_facilitation_needed":
         return True
     return False
+
+
+def attention_severity(event: dict, *, critical: bool = False) -> str:
+    """Make receipt/display severity agree with existing attention routing.
+
+    No governance decision or source event changes. Some critical event types
+    omit severity; recording them as info hides unacknowledged deliveries.
+    """
+    severity = str(event.get("severity") or "info").lower()
+    if critical and severity not in {"high", "critical"}:
+        return "critical"
+    return severity

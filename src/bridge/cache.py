@@ -2,12 +2,66 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import logging
+from collections import OrderedDict
 
 import aiosqlite
 
 log = logging.getLogger(__name__)
+
+
+class FindingDeliveryCache:
+    """Coalesce exact REST/WS copies after confirmed delivery, per channel.
+
+    Bounded and process-local, not incident suppression. Distinct findings and
+    critical mirrors still deliver; failures leave the other sender free to try.
+    """
+
+    def __init__(self, max_entries: int = 1000) -> None:
+        self._sent: OrderedDict[str, int] = OrderedDict()
+        self._pending: dict[str, asyncio.Future] = {}
+        self._max_entries = max_entries
+
+    async def send(self, channel, embed, event: dict | None) -> tuple[int | None, bool]:
+        event = event or {}
+        channel_id = getattr(channel, "id", None)
+        eligible = (
+            str(event.get("type") or "").endswith("_finding")
+            and event.get("event_id") is not None
+            and event.get("timestamp")
+            and isinstance(channel_id, int)
+        )
+        if not eligible:
+            message = await channel.send(embed=embed)
+            return getattr(message, "id", None), False
+        identity = [channel_id] + [event.get(k) for k in (
+            "type", "event_id", "timestamp", "agent_id", "severity",
+            "fingerprint", "message", "tags", "evidence",
+        )]
+        key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+        # Only identical sends wait on each other; an unrelated critical alert
+        # must not wait behind another channel's network operation.
+        while key in self._pending:
+            await asyncio.shield(self._pending[key])
+        if key in self._sent:
+            self._sent.move_to_end(key)
+            return self._sent[key], True
+        pending = asyncio.get_running_loop().create_future()
+        self._pending[key] = pending
+        try:
+            message = await channel.send(embed=embed)
+            message_id = getattr(message, "id", None)
+            if isinstance(message_id, int):
+                self._sent[key] = message_id
+                while len(self._sent) > self._max_entries:
+                    self._sent.popitem(last=False)
+            return message_id, False
+        finally:
+            self._pending.pop(key, None)
+            pending.set_result(None)
 
 
 class BridgeCache:

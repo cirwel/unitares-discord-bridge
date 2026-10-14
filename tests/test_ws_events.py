@@ -62,6 +62,45 @@ def test_missing_type_returns_none():
     assert broadcaster_event_to_embed({"type": ""}) is None
 
 
+def test_finding_uses_full_message_and_evidence_renderer():
+    embed = broadcaster_event_to_embed({
+        "type": "sentinel_alarm_finding", "severity": "high", "event_id": 6,
+        "message": "held by another writer", "agent_label": "Sentinel",
+        "evidence": {"kind": "forced_release", "assessment": "no_lease_row"},
+    })
+    assert embed.title == "Sentinel Alarm Finding"
+    assert embed.description == "held by another writer"
+    assert any(f.name == "Event check" for f in embed.fields)
+
+
+@pytest.mark.parametrize("event", [
+    {"type": "lifecycle_silent_critical"}, {"type": "lifecycle_paused"},
+    {"type": "circuit_breaker_trip", "severity": "info"},
+    {"type": "dialectic_facilitation_needed"},
+])
+def test_critical_routing_and_receipt_severity_agree(event):
+    sub = _subscriber_with_resident_channels()
+    assert is_critical_broadcaster_event(event)
+    assert sub._receipt_payload("bridge.delivery", event)["source_severity"] == "critical"
+    assert "severity" not in event or event["severity"] == "info"  # source untouched
+
+
+@pytest.mark.asyncio
+async def test_ws_high_finding_reaches_alerts_without_critical_tag():
+    sub = _subscriber_with_resident_channels("sentinel")
+    event = {"type": "sentinel_alarm_finding", "severity": "high"}
+    assert await _dispatch_and_collect(sub, event) == ["sentinel", "alerts"]
+    assert sub._receipt_payload("bridge.delivery", event)["source_severity"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_ws_and_rest_share_resident_fallback_destination():
+    sub = _subscriber_with_resident_channels("sentinel")
+    sub.residents_channel = MagicMock(spec=discord.TextChannel)
+    sub.residents_channel.name = "residents"
+    assert await _dispatch_and_collect(sub, {"type": "vigil_finding", "severity": "medium"}) == ["residents"]
+
+
 # ---------------------------------------------------------------------------
 # Lifecycle events
 # ---------------------------------------------------------------------------

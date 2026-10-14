@@ -14,9 +14,9 @@ log = logging.getLogger(__name__)
 CHANNEL_STRUCTURE: dict[str, dict[str, dict[str, str]]] = {
     "GOVERNANCE": {
         "activity": {"type": "text", "topic": "Routine agent activity — onboards, idle, lifecycle_created/resumed/archived, knowledge writes"},
-        "signals": {"type": "text", "topic": "Operator attention — verdict changes, drift, risk, identity assurance, circuit breakers, confidence clamps"},
-        "alerts": {"type": "text", "topic": "Critical only — pause, reject, stuck, silent critical, circuit breaker trip"},
-        "residents": {"type": "text", "topic": "Resident findings without a channel of their own — Vigil, Watcher, and any new resident"},
+        "signals": {"type": "text", "topic": "Diagnostic feed — drift, risk and governance transitions. Start with #alerts for urgent triage; messages here are not a separate task queue."},
+        "alerts": {"type": "text", "topic": "Start here for urgent triage — pauses, stuck/silent-critical agents, critical findings and human-review requests. ✅ means seen, not resolved or approved."},
+        "residents": {"type": "text", "topic": "Resident diagnostic detail — critical/high findings also reach #alerts. Not a separate task queue; ✅ means seen, not resolved."},
         "governance-hud": {"type": "text", "topic": "Auto-updating system status"},
     },
     "LUMEN": {
@@ -90,7 +90,7 @@ def _resident_finding_channels(
         out[key] = {
             "type": "text",
             "topic": f"{key.replace('-', ' ').title()} findings only — "
-                     "split out of #residents so they can be read or muted on their own",
+                     "diagnostic detail; critical/high findings also reach #alerts. Not a separate task queue.",
         }
     return out
 

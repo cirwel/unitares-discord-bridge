@@ -1,5 +1,9 @@
 import pytest
 from bridge.cache import BridgeCache
+from bridge.cache import FindingDeliveryCache
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 
 @pytest.fixture
@@ -45,3 +49,112 @@ async def test_hud_message(cache):
         channel_id, message_id = await cache.get_hud_message()
         assert channel_id == 111
         assert message_id == 222
+
+
+def finding(**changes):
+    return {"type": "sentinel_alarm_finding", "event_id": 6,
+            "timestamp": "2026-10-14T08:32:47Z", "agent_id": "resident",
+            "severity": "medium", "fingerprint": "lease-conflict",
+            "message": "held by another writer", **changes}
+
+
+def channel(channel_id=1):
+    return SimpleNamespace(id=channel_id, send=AsyncMock(return_value=SimpleNamespace(id=123)))
+
+
+@pytest.mark.asyncio
+async def test_exact_concurrent_copies_send_once():
+    cache, ch = FindingDeliveryCache(), channel()
+    results = await asyncio.gather(*(cache.send(ch, None, finding()) for _ in range(3)))
+    assert results == [(123, False), (123, True), (123, True)]
+    assert ch.send.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", [
+    {"event_id": 7}, {"timestamp": "2026-10-14T09:32:47Z"},
+    {"severity": "critical"}, {"message": "new evidence"},
+    {"fingerprint": "different-lease"}, {"agent_id": "other-resident"},
+    {"tags": ["critical"]}, {"evidence": {"assessment": "no_lease_row"}},
+])
+async def test_changed_findings_are_not_suppressed(change):
+    cache, ch = FindingDeliveryCache(), channel()
+    await cache.send(ch, None, finding())
+    assert await cache.send(ch, None, finding(**change)) == (123, False)
+    assert ch.send.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_destination_mirrors_are_preserved():
+    cache, detail, alerts = FindingDeliveryCache(), channel(1), channel(2)
+    await cache.send(detail, None, finding())
+    assert await cache.send(alerts, None, finding()) == (123, False)
+    assert detail.send.await_count == alerts.send.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_send_does_not_prevent_other_sender_delivery():
+    cache, ch = FindingDeliveryCache(), channel()
+    ch.send.side_effect = [RuntimeError("transport failed"), SimpleNamespace(id=456)]
+    with pytest.raises(RuntimeError):
+        await cache.send(ch, None, finding())
+    assert await cache.send(ch, None, finding()) == (456, False)
+    assert not cache._pending
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event", [finding(timestamp=None), finding(event_id=None),
+                                         {"type": "lifecycle_silent_critical"}, None])
+async def test_missing_identity_and_nonfindings_fail_open(event):
+    cache, ch = FindingDeliveryCache(), channel()
+    await cache.send(ch, None, event)
+    assert await cache.send(ch, None, event) == (123, False)
+    assert ch.send.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_cancelled_sender_releases_identical_waiter():
+    cache, ch = FindingDeliveryCache(), channel()
+    started, release = asyncio.Event(), asyncio.Event()
+    async def slow_send(**kwargs):
+        started.set()
+        await release.wait()
+        return SimpleNamespace(id=123)
+    ch.send.side_effect = slow_send
+    first = asyncio.create_task(cache.send(ch, None, finding()))
+    await started.wait()
+    second = asyncio.create_task(cache.send(ch, None, finding()))
+    await asyncio.sleep(0)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    release.set()
+    assert await asyncio.wait_for(second, 1) == (123, False)
+    assert not cache._pending
+
+
+@pytest.mark.asyncio
+async def test_unrelated_critical_does_not_wait_for_slow_destination():
+    cache, slow, urgent = FindingDeliveryCache(), channel(1), channel(2)
+    started, release = asyncio.Event(), asyncio.Event()
+    async def slow_send(**kwargs):
+        started.set()
+        await release.wait()
+        return SimpleNamespace(id=123)
+    slow.send.side_effect = slow_send
+    first = asyncio.create_task(cache.send(slow, None, finding()))
+    await started.wait()
+    try:
+        assert await asyncio.wait_for(cache.send(urgent, None, finding(severity="critical")), 1) == (123, False)
+    finally:
+        release.set()
+        await first
+
+
+@pytest.mark.asyncio
+async def test_dedup_memory_is_bounded_and_evicted_event_delivers():
+    cache, ch = FindingDeliveryCache(max_entries=2), channel()
+    for event_id in range(3):
+        await cache.send(ch, None, finding(event_id=event_id))
+    assert len(cache._sent) == 2
+    assert await cache.send(ch, None, finding(event_id=0)) == (123, False)
