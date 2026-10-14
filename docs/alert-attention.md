@@ -62,3 +62,19 @@ host or network. The local bridge-liveness watchdog can restart a hung bridge,
 but does not replace an external missed-heartbeat check. Repair/deploy authority,
 governance rules, credentials and operator stops remain unchanged. No autonomous
 repair loop is introduced by these delivery fixes.
+
+## Making the navigation guide easy to find
+
+Pin the existing navigation message in `#alerts`; do not post repeated copies.
+Discord requires the separate **Pin Messages** permission (`PIN_MESSAGES`),
+not Administrator or a broader message-deletion grant. If the bridge lacks it,
+the server owner can either pin the guide directly or allow **Pin Messages**
+for the bridge member in `#alerts` only. Leave all other permissions unchanged.
+Read back the message's `pinned` state before reporting success.
+
+The bot cannot normally grant permissions it does not already hold in the guild
+or parent channel. Do not work around that boundary by self-granting an override
+for Manage Permissions, obtaining a human token, or widening server roles.
+See Discord's [pin-message API](https://docs.discord.com/developers/resources/message#pin-message)
+and [channel permission rules](https://docs.discord.com/developers/resources/channel#edit-channel-permissions).
+Pinning is navigation, not verification that alerts reach a phone.
