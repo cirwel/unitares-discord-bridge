@@ -10,8 +10,9 @@ from datetime import datetime, timezone
 import discord
 
 from bridge import config
-from bridge.cache import BridgeCache
+from bridge.cache import BridgeCache, FindingDeliveryCache
 from bridge.embeds import (
+    attention_severity,
     classify_rest_event,
     event_to_embed,
     finding_resident_key,
@@ -62,9 +63,11 @@ class EventPoller:
         audit_channel: discord.TextChannel | None = None,
         residents_channel: discord.TextChannel | None = None,
         resident_channels: dict[str, discord.TextChannel] | None = None,
+        delivery_cache: FindingDeliveryCache | None = None,
     ) -> None:
         self.gov = gov_client
         self.cache = cache
+        self.delivery_cache = delivery_cache
         self.activity_channel = activity_channel
         self.signals_channel = signals_channel
         self.alerts_channel = alerts_channel
@@ -266,7 +269,9 @@ class EventPoller:
             "source_event_id": source_event.get("event_id"),
             "source_event_type": source_event.get("type"),
             "source_agent_id": source_event.get("agent_id"),
-            "source_severity": source_event.get("severity", "info"),
+            "source_severity": attention_severity(
+                source_event, critical=is_critical_event(source_event),
+            ),
         }
         if channel is not None:
             payload.update({
@@ -308,12 +313,17 @@ class EventPoller:
         while True:
             channel, embed, source_event = await self._message_queue.get()
             try:
-                message = await channel.send(embed=embed)
+                if self.delivery_cache is not None:
+                    message_id, duplicate = await self.delivery_cache.send(channel, embed, source_event)
+                else:
+                    message = await channel.send(embed=embed)
+                    message_id, duplicate = getattr(message, "id", None), False
                 await self._record_receipt(
-                    "bridge.delivery",
+                    "bridge.suppressed" if duplicate else "bridge.delivery",
                     source_event=source_event,
                     channel=channel,
-                    discord_message_id=getattr(message, "id", None),
+                    discord_message_id=message_id,
+                    reason="duplicate_finding_delivery" if duplicate else None,
                 )
             except discord.RateLimited as exc:
                 # Raised when max_ratelimit_timeout is set and the retry-after exceeds it.

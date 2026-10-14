@@ -16,7 +16,7 @@ from bridge.config import (
     DIGEST_ENABLED, DIGEST_INTERVAL, DIGEST_WINDOW, DIGEST_CHECK_INTERVAL,
     DIGEST_RELATIONAL_THRESHOLD, LUMEN_OFFLINE_MENTION,
 )
-from bridge.cache import BridgeCache
+from bridge.cache import BridgeCache, FindingDeliveryCache
 from bridge.mcp_client import GovernanceClient, AnimaClient
 from bridge.server_setup import ensure_server_structure
 from bridge.event_poller import EventPoller
@@ -141,12 +141,14 @@ async def on_ready():
     }
 
     if activity_ch and signals_ch and alerts_ch:
+        delivery_cache = FindingDeliveryCache()
         event_poller = EventPoller(
             gov_client, cache, activity_ch, signals_ch, alerts_ch,
             EVENT_POLL_INTERVAL,
             audit_channel=audit_channel,
             residents_channel=residents_ch,
             resident_channels=resident_channels,
+            delivery_cache=delivery_cache,
         )
         await event_poller.start()
         log.info(
@@ -199,6 +201,8 @@ async def on_ready():
             lease_plane_phase_b_channel=phase_b_ch,
             gov_client=gov_client,
             resident_channels=resident_channels,
+            residents_channel=residents_ch,
+            delivery_cache=delivery_cache,
         )
         await ws_subscriber.start()
         log.info(

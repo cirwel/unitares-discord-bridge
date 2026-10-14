@@ -3,16 +3,66 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from unittest.mock import AsyncMock, MagicMock
 
 import discord
 import pytest
 
 from bridge.event_poller import EventPoller
+from bridge.cache import FindingDeliveryCache
+from bridge.ws_events import WSEventSubscriber
 
 
 _UNSET = object()  # distinguishes "no probe configured" from probe_events=None
 # (None now means "the probe FETCH FAILED" — fetch_events' error value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ws_first", [True, False])
+async def test_both_actual_senders_share_delivery_and_suppression_receipts(ws_first):
+    gov = MagicMock()
+    gov.record_bridge_event = AsyncMock(return_value=True)
+    ch = MagicMock(spec=discord.TextChannel)
+    ch.id, ch.name = 123, "sentinel"
+    ch.send = AsyncMock(return_value=MagicMock(id=456))
+    shared = FindingDeliveryCache()
+    poller = EventPoller(gov, MagicMock(), ch, ch, ch, delivery_cache=shared)
+    sub = WSEventSubscriber("http://localhost:8767", ch, ch, ch,
+                            gov_client=gov, delivery_cache=shared)
+    event = {"type": "sentinel_alarm_finding", "event_id": 6,
+             "timestamp": "2026-10-14T08:32:47Z", "severity": "medium"}
+    item = (ch, discord.Embed(title="finding"), event)
+    await poller._message_queue.put(item)
+    await sub._send_queue.put(item)
+    loops = [sub._send_loop, poller._send_loop] if ws_first else [poller._send_loop, sub._send_loop]
+    tasks = [asyncio.create_task(fn()) for fn in loops]
+    try:
+        for _ in range(100):
+            if gov.record_bridge_event.await_count == 2:
+                break
+            await asyncio.sleep(.01)
+        assert ch.send.await_count == 1
+        receipts = [call.args[0] for call in gov.record_bridge_event.await_args_list]
+        assert {r["event_type"] for r in receipts} == {"bridge.delivery", "bridge.suppressed"}
+        assert {r["discord_message_id"] for r in receipts} == {"456"}
+        suppressed = next(r for r in receipts if r["event_type"] == "bridge.suppressed")
+        assert suppressed["reason"] == "duplicate_finding_delivery"
+    finally:
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+
+@pytest.mark.parametrize("event", [
+    {"type": "dialectic_facilitation_needed"},
+    {"type": "verdict_change", "to": "pause", "severity": "info"},
+])
+def test_rest_critical_receipt_does_not_default_to_info(event):
+    poller, _ = _make_poller([])
+    assert poller._receipt_payload("bridge.delivery", event)["source_severity"] == "critical"
 
 
 def _make_poller(

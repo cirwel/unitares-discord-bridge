@@ -8,6 +8,10 @@ Discord bot that surfaces UNITARES governance events and Lumen state in Discord.
 
 ## What It Does
 
+For a manageable operator view, start with [Reading the existing alert
+channels](docs/alert-attention.md): #alerts is the urgent triage entry point;
+resident channels carry supporting detail, and acknowledgements are not fixes.
+
 - **Governance events** — Check-ins, verdicts, dialectic sessions
 - **Lumen state** — Sensor readings, creature status from the embodied agent
 - **Lumen self-iteration** — Provenance-labeled proposal/review/canary attention with critical recovery routing
