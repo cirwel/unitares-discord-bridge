@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 import discord
 
 from bridge import config
-from bridge.agent_tags import AgentTagResolver, has_any
+from bridge.agent_tags import AgentTagResolver, has_any, is_positively_nonresident
 from bridge.cache import BridgeCache, FindingDeliveryCache
 from bridge.embeds import (
     attention_severity,
@@ -121,17 +121,27 @@ class EventPoller:
         return await self.tag_resolver.tags(event.get("agent_id"))
 
     @staticmethod
-    def _suppression_reason(event: dict, tags: frozenset[str] | None) -> str | None:
-        """Why this event is receipted but not posted, or ``None`` to post it."""
+    def _is_nonresident_subject(event: dict, tags: frozenset[str] | None) -> bool:
+        """A resident-only event type whose subject governance positively marks
+        non-resident (e.g. tagged ``ephemeral``). Unknown, empty or failed
+        lookups are NOT non-resident: they post as before."""
+        t = str(event.get("type") or "").lower()
+        return t in config.RESIDENT_ONLY_EVENT_TYPES and is_positively_nonresident(
+            tags,
+            nonresident_tags=config.NONRESIDENT_AGENT_TAGS,
+            resident_tags=config.RESIDENT_AGENT_TAGS,
+        )
+
+    @classmethod
+    def _suppression_reason(cls, event: dict, tags: frozenset[str] | None) -> str | None:
+        """Why this event is receipted but not posted, or ``None`` to post it.
+
+        A critical event is never suppressed here: a non-resident's critical
+        risk crossing still goes to #alerts (see the routing below).
+        """
         if config.SUPPRESS_DISMISSED_RESOLUTIONS and is_dismissed_resolution(event):
             return "dismissed_resolution"
-        t = str(event.get("type") or "").lower()
-        # Unknown tags (None) post as before; only a positive non-resident
-        # answer from governance suppresses.
-        if (
-            t in config.RESIDENT_ONLY_EVENT_TYPES
-            and has_any(tags, config.RESIDENT_AGENT_TAGS) is False
-        ):
+        if cls._is_nonresident_subject(event, tags) and not is_critical_event(event):
             return "non_resident_agent"
         return None
 
@@ -252,6 +262,11 @@ class EventPoller:
                         continue
                     event_for_embed = _with_resident_label(event, label_by_id)
                     embed = event_to_embed(event_for_embed)
+                    if self._is_nonresident_subject(event, tags):
+                        # Critical (else it was suppressed above): page the
+                        # operator once, skip the routine #signals copy.
+                        await self._message_queue.put((self.alerts_channel, embed, event))
+                        continue
                     target = self._finding_channel(event)
                     if target is None and (
                         self.embodied_channel is not None

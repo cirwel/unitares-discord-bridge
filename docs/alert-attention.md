@@ -6,9 +6,9 @@ assignments. No new channel or resident is needed.
 
 | Existing channel | What it is for | What to do |
 |---|---|---|
-| #alerts | Pauses, stuck/silent-critical agents, critical findings, residents' ≥70% risk crossings, human-review requests | Check the named subject, time and evidence; identify one owner for the underlying condition. |
+| #alerts | Pauses, stuck/silent-critical agents, high/critical resident alarms, ≥70% risk crossings, human-review requests | Check the named subject, time and evidence; identify one owner for the underlying condition. |
 | #signals | Diagnostic transitions such as drift, risk and adjustment, for resident agents | Consult when investigating an alert; not another urgent task queue. |
-| #sentinel, #doctor, #residents | Resident findings, each posted once | Consult the relevant producer. A critical finding goes to #alerts instead of here, not in addition. |
+| #sentinel, #doctor, #residents | Resident findings, each posted once | Consult the relevant producer. A high/critical alarm goes to #alerts instead of here, not in addition; routine pattern-hit classes stay here at any severity. |
 | #activity, #governance-hud | Routine events (new *resident* agents, archives, knowledge writes) and current reported state | Context, not proof every job completed successfully. |
 | #lumen-sensors | Lumen observations, offline/recovery transitions, and Lumen's own drift-oscillation / trajectory-adjustment chatter | This is still the existing Lumen outage destination; do not assume all Lumen outages appear in #alerts. |
 | #lumen-iterations | Read-only proposal/review/canary attention | A post or reaction is not a signed review or permission to deploy. |
@@ -18,11 +18,13 @@ assignments. No new channel or resident is needed.
 These are receipted to governance as `bridge.suppressed` (with a reason) and
 never posted, so the volume is still auditable:
 
-- `agent_new` and `risk_threshold` for agents governance does not mark as
-  resident (reason `non_resident_agent`). The bridge reads the subject agent's
-  governance tags with `agent(action="get")`: an agent tagged `persistent`,
-  `protected` or `embodied` is a resident; a short-lived session (tagged
-  `ephemeral`) is not. If the tags cannot be read, the event posts as before.
+- `agent_new` and non-critical `risk_threshold` for agents governance
+  positively marks as short-lived (reason `non_resident_agent`). The bridge
+  reads the subject agent's governance tags with `agent(action="get")`: only
+  an agent tagged `ephemeral` and none of `persistent`/`protected`/`embodied`
+  is filtered. Empty tags or a failed lookup post as before. A critical
+  (≥70%) risk crossing is never dropped: for a short-lived session it goes to
+  #alerts only, without the #signals copy.
 - Resolution findings whose action is `dismissed` (Watcher's "[dismissed] ..."
   closures; reason `dismissed_resolution`). Confirmed resolutions still post,
   to the resident channel only.
@@ -30,7 +32,7 @@ never posted, so the volume is still auditable:
 Settings (all optional): `BRIDGE_RESIDENT_ONLY_EVENT_TYPES`,
 `BRIDGE_RESIDENT_AGENT_TAGS`, `BRIDGE_EMBODIED_STATE_EVENT_TYPES`,
 `BRIDGE_EMBODIED_AGENT_TAGS`, `BRIDGE_EMBODIED_STATE_CHANNEL`,
-`BRIDGE_FINDING_ALERT_SEVERITIES` (default `critical`) and
+`BRIDGE_FINDING_ALERT_SEVERITIES` (default `high,critical`) and
 `BRIDGE_SUPPRESS_DISMISSED_RESOLUTIONS`; see `src/bridge/config.py`.
 
 ## One condition, not one task per message
@@ -47,8 +49,15 @@ mute. Suppression receipts retain the delivered message ID and reason
 `duplicate_finding_delivery`.
 
 Each finding has exactly one destination: #alerts when its severity is in
-`BRIDGE_FINDING_ALERT_SEVERITIES` (default `critical`), otherwise its resident
-channel. Findings are no longer mirrored to a second channel.
+`BRIDGE_FINDING_ALERT_SEVERITIES` (default `high,critical`), otherwise its
+resident channel. Findings are no longer mirrored to a second channel. Three
+noisy pattern-hit classes never page #alerts at any severity, by an explicit
+list in `src/bridge/embeds.py`: Watcher pattern findings (`watcher_finding`),
+Sentinel's batched held-by-other lease conflicts (`sentinel_alarm_finding`
+with `alarm_kind=conflict_batch`), and deploy-drift "merged commit(s) not
+pulled" lag. Genuine alarms (Sentinel verdict shift, coordinated degradation
+and forced release; Lumen check-in outage; Vigil service-down; lease-plane
+health; bridge liveness; a live checkout on the wrong branch) still do.
 
 WebSocket findings use the same full message/evidence renderer and destination
 rules as polled findings. This avoids the previous pair of a detail-free lowercase

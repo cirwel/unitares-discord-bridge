@@ -684,3 +684,25 @@ async def test_anima_fetch_qa_error_returns_none():
         result = await client.fetch_qa()
 
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_untracked_call_tool_failure_leaves_failure_counter_alone():
+    # Auxiliary reads (agent tag lookups) must not raise a false
+    # "Governance MCP Unreachable" alert.
+    with mock_httpx_client_error("post", Exception("500 error")):
+        client = GovernanceClient("http://localhost:8767")
+        client.consecutive_failures = 2
+        result = await client.call_tool("agent", {"action": "get"}, track_failures=False)
+    assert result is None
+    assert client.consecutive_failures == 2
+
+
+@pytest.mark.asyncio
+async def test_untracked_call_tool_success_does_not_clear_failure_counter():
+    resp = make_mock_response(json_data={"result": {"tags": []}})
+    with mock_httpx_client("post", resp):
+        client = GovernanceClient("http://localhost:8767")
+        client.consecutive_failures = 3
+        await client.call_tool("agent", {"action": "get"}, track_failures=False)
+    assert client.consecutive_failures == 3

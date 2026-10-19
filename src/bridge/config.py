@@ -114,18 +114,20 @@ def _csv_set(name: str, default: str) -> frozenset[str]:
 
 # Resident-only event types. agent_new and risk_threshold fire for every
 # short-lived codex/claude session (~72 posts/day, ~40% of all bridge traffic
-# over 14 days, 2026-10). They are posted only when the subject agent carries
-# one of BRIDGE_RESIDENT_AGENT_TAGS, read from governance's own agent record
-# (agent(action="get").tags). Residents carry `persistent` (governance stamps
-# RESIDENT_DEFAULT_TAGS on them); throwaway sessions carry `ephemeral`. An
-# agent whose tags cannot be read is posted as before: an unreachable lookup
-# must not hide a real signal. Set the event-type list to "" to disable.
+# over 14 days, 2026-10). They are suppressed only on a POSITIVE answer from
+# governance's own agent record (agent(action="get").tags): the agent carries
+# one of BRIDGE_NONRESIDENT_AGENT_TAGS (governance stamps `ephemeral` on
+# throwaway sessions) and none of BRIDGE_RESIDENT_AGENT_TAGS (residents carry
+# `persistent`). Empty tags, unknown tags or a failed lookup post as before.
+# A critical event (risk >= 70%) is never dropped: for a non-resident it still
+# goes to #alerts, just not to #signals as well. "" disables the filter.
 RESIDENT_ONLY_EVENT_TYPES = _csv_set(
     "BRIDGE_RESIDENT_ONLY_EVENT_TYPES", "agent_new,risk_threshold"
 )
 RESIDENT_AGENT_TAGS = _csv_set(
     "BRIDGE_RESIDENT_AGENT_TAGS", "persistent,protected,embodied"
 )
+NONRESIDENT_AGENT_TAGS = _csv_set("BRIDGE_NONRESIDENT_AGENT_TAGS", "ephemeral")
 
 # Embodied-agent state chatter. drift_oscillation (governance's detector calls
 # it self-correcting) and trajectory_adjustment for an embodied agent (Lumen)
@@ -140,14 +142,28 @@ EMBODIED_STATE_CHANNEL = os.environ.get(
     "BRIDGE_EMBODIED_STATE_CHANNEL", "lumen-sensors"
 ).strip()
 
-# How long a looked-up agent tag set is trusted before it is re-read.
+# How long a looked-up agent tag set is trusted before it is re-read. Resident
+# answers are stable; anything else is re-read sooner so an agent promoted to
+# resident (or tagged after its first check-in) is not mis-filtered for long.
+# Failed lookups are remembered briefly so a governance outage is not hammered.
 AGENT_TAGS_TTL_SECONDS = float(os.environ.get("BRIDGE_AGENT_TAGS_TTL_SECONDS", "3600"))
+AGENT_TAGS_NONRESIDENT_TTL_SECONDS = float(
+    os.environ.get("BRIDGE_AGENT_TAGS_NONRESIDENT_TTL_SECONDS", "300")
+)
+AGENT_TAGS_FAILURE_TTL_SECONDS = float(
+    os.environ.get("BRIDGE_AGENT_TAGS_FAILURE_TTL_SECONDS", "60")
+)
 
 # Resident findings post ONCE to ONE channel. A finding whose severity is in
-# this set goes to #alerts (it needs the operator); every other finding goes to
-# its resident channel only. Before 2026-10 high/critical findings were posted
-# to both, so Watcher's routine high-severity pattern hits doubled in #alerts.
-FINDING_ALERT_SEVERITIES = _csv_set("BRIDGE_FINDING_ALERT_SEVERITIES", "critical")
+# this set goes to #alerts (it needs the operator) unless its class is one of
+# the explicit noisy pattern-hit classes in embeds._FINDING_ALERT_EXCLUSIONS
+# (Watcher pattern hits, Sentinel held-by-other lease conflicts, deploy-drift
+# "merged commits not pulled" lag); every other finding goes to its resident
+# channel only. `high` is included because it is the top severity several
+# genuine alarms use (Sentinel verdict_shift / coordinated degradation /
+# forced release). Before 2026-10 high/critical findings were posted to both
+# channels, so Watcher's routine high-severity pattern hits doubled in #alerts.
+FINDING_ALERT_SEVERITIES = _csv_set("BRIDGE_FINDING_ALERT_SEVERITIES", "high,critical")
 
 # A resolution finding whose action is "dismissed" (Watcher's "[dismissed] ..."
 # closures, ~8/day) records that nothing needs doing. It is receipted as

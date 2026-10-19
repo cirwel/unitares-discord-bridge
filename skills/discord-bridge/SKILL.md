@@ -30,9 +30,9 @@ facilitation, Lumen sensors/art, and bounded self-iteration attention.
 
 The bridge operates across several visible layers:
 
-1. **Activity and signals**: Routine lifecycle/knowledge events are separated from operator-attention events and critical alerts. New-agent and risk-threshold events post only for agents governance tags as resident (`persistent`/`protected`/`embodied`); an embodied agent's drift-oscillation and trajectory-adjustment chatter goes to `#lumen-sensors`.
+1. **Activity and signals**: Routine lifecycle/knowledge events are separated from operator-attention events and critical alerts. New-agent and non-critical risk-threshold events are not posted for agents governance tags `ephemeral` (critical crossings still reach `#alerts`); an embodied agent's drift-oscillation and trajectory-adjustment chatter goes to `#lumen-sensors`.
 2. **HUD**: A live fleet view with agent counts and measured EISV; missing state is rendered as `no state`, never as a seed vector.
-3. **Resident findings**: Each finding posts once, to one channel. Sentinel and Doctor have dedicated channels by default; other residents fall back to `#residents`; a critical finding goes to `#alerts` instead. Dismissed resolutions are receipted, not posted.
+3. **Resident findings**: Each finding posts once, to one channel. Sentinel and Doctor have dedicated channels by default; other residents fall back to `#residents`; a high/critical alarm goes to `#alerts` instead, except listed noisy pattern-hit classes. Dismissed resolutions are receipted, not posted.
 4. **Lumen**: Optional physical state, drawings, sensor availability, and weekly Q&A digest from Anima.
 5. **Self-iteration attention**: Read-only, provenance-labeled proposals/reviews/canaries go to `#lumen-iterations`; high-priority items are mirrored to `#signals` and critical ones to `#alerts` as well.
 6. **Class routing / violations**: Typed WebSocket events can be mirrored to class-specific channels when enabled.

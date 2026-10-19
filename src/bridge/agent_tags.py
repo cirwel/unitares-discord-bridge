@@ -25,8 +25,16 @@ class AgentTagResolver:
 
     ``tags()`` returns ``None`` when the tags are unknown (lookup failed,
     agent not found, unparseable reply). Callers treat unknown as "post as
-    before" so a governance hiccup can never silently hide an event. Failures
-    are not cached; successful reads live for ``ttl`` seconds.
+    before" so a governance hiccup can never silently hide an event.
+
+    Cache lifetimes: an answer containing one of ``resident_tags`` lives
+    ``ttl`` (stable); any other answer lives ``nonresident_ttl`` (short, so a
+    newly tagged resident is not mis-filtered for long); a failed lookup is
+    remembered as unknown for ``failure_ttl`` so an outage is not hammered.
+
+    Lookups go through the client's untracked side path: they never move the
+    ``consecutive_failures`` counter behind the "Governance MCP Unreachable"
+    alert.
     """
 
     def __init__(
@@ -34,16 +42,23 @@ class AgentTagResolver:
         gov: GovernanceClient,
         *,
         ttl: float = 3600.0,
+        nonresident_ttl: float = 300.0,
+        failure_ttl: float = 60.0,
+        resident_tags: frozenset[str] = frozenset({"persistent", "protected", "embodied"}),
         max_entries: int = 2000,
         timeout: float = 5.0,
     ) -> None:
         self.gov = gov
         self.ttl = ttl
+        self.nonresident_ttl = nonresident_ttl
+        self.failure_ttl = failure_ttl
+        self.resident_tags = frozenset(resident_tags)
         # Lookups run inside the REST poll loop; a slow governance read must
         # not stall the batch (or the liveness heartbeat) for call_tool's 30s.
         self.timeout = timeout
         self.max_entries = max_entries
-        self._cache: OrderedDict[str, tuple[float, frozenset[str]]] = OrderedDict()
+        # agent_id -> (expires_at monotonic, tags or None for a failed lookup)
+        self._cache: OrderedDict[str, tuple[float, frozenset[str] | None]] = OrderedDict()
 
     async def tags(self, agent_id: str | None) -> frozenset[str] | None:
         if not agent_id:
@@ -51,13 +66,17 @@ class AgentTagResolver:
         key = str(agent_id)
         now = time.monotonic()
         hit = self._cache.get(key)
-        if hit is not None and now - hit[0] < self.ttl:
+        if hit is not None and now < hit[0]:
             self._cache.move_to_end(key)
             return hit[1]
         tags = await self._fetch(key)
         if tags is None:
-            return None
-        self._cache[key] = (now, tags)
+            life = self.failure_ttl
+        elif tags & self.resident_tags:
+            life = self.ttl
+        else:
+            life = self.nonresident_ttl
+        self._cache[key] = (now + life, tags)
         self._cache.move_to_end(key)
         while len(self._cache) > self.max_entries:
             self._cache.popitem(last=False)
@@ -68,6 +87,7 @@ class AgentTagResolver:
             result = await asyncio.wait_for(
                 self.gov.call_tool(
                     "agent", {"action": "get", "agent_id": agent_id, "lite": True},
+                    track_failures=False,
                 ),
                 timeout=self.timeout,
             )
@@ -99,3 +119,15 @@ def has_any(tags: frozenset[str] | None, wanted: frozenset[str]) -> bool | None:
     if tags is None:
         return None
     return bool(tags & wanted)
+
+
+def is_positively_nonresident(
+    tags: frozenset[str] | None,
+    *,
+    nonresident_tags: frozenset[str],
+    resident_tags: frozenset[str],
+) -> bool:
+    """Only a positive non-resident answer counts: unknown or empty tags do not."""
+    if not tags:
+        return False
+    return bool(tags & nonresident_tags) and not (tags & resident_tags)

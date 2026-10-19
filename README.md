@@ -76,9 +76,10 @@ variable to an empty string to put everyone back on `#residents`.
 
 Each finding is posted once, to one channel: its resident channel, or
 `#alerts` instead when its severity is in `BRIDGE_FINDING_ALERT_SEVERITIES`
-(default `critical`). Dismissed resolution findings are receipted, not posted.
-New-agent and risk-threshold events are posted only for resident agents (by
-governance tag, see [docs/alert-attention.md](docs/alert-attention.md)), and
+(default `high,critical`) and it is not one of the listed noisy pattern-hit
+classes. Dismissed resolution findings are receipted, not posted. New-agent
+and non-critical risk-threshold events are not posted for agents governance
+tags `ephemeral` (see [docs/alert-attention.md](docs/alert-attention.md)), and
 Lumen's drift-oscillation / trajectory-adjustment chatter goes to
 `#lumen-sensors` instead of `#signals`.
 

@@ -15,7 +15,8 @@ from bridge.config import (
     RESIDENT_FINDING_CHANNELS, SYNC_CHANNEL_TOPICS,
     DIGEST_ENABLED, DIGEST_INTERVAL, DIGEST_WINDOW, DIGEST_CHECK_INTERVAL,
     DIGEST_RELATIONAL_THRESHOLD, LUMEN_OFFLINE_MENTION,
-    AGENT_TAGS_TTL_SECONDS, EMBODIED_STATE_CHANNEL,
+    AGENT_TAGS_TTL_SECONDS, AGENT_TAGS_NONRESIDENT_TTL_SECONDS,
+    AGENT_TAGS_FAILURE_TTL_SECONDS, RESIDENT_AGENT_TAGS, EMBODIED_STATE_CHANNEL,
 )
 from bridge.agent_tags import AgentTagResolver
 from bridge.cache import BridgeCache, FindingDeliveryCache
@@ -170,7 +171,13 @@ async def on_ready():
             residents_channel=residents_ch,
             resident_channels=resident_channels,
             delivery_cache=delivery_cache,
-            tag_resolver=AgentTagResolver(gov_client, ttl=AGENT_TAGS_TTL_SECONDS),
+            tag_resolver=AgentTagResolver(
+                gov_client,
+                ttl=AGENT_TAGS_TTL_SECONDS,
+                nonresident_ttl=AGENT_TAGS_NONRESIDENT_TTL_SECONDS,
+                failure_ttl=AGENT_TAGS_FAILURE_TTL_SECONDS,
+                resident_tags=RESIDENT_AGENT_TAGS,
+            ),
             embodied_channel=embodied_ch,
         )
         await event_poller.start()

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import re
+from typing import Callable
+
 import discord
 
 from bridge import config
@@ -225,16 +228,48 @@ def is_dismissed_resolution(event: dict) -> bool:
     )
 
 
+# deploy_drift_doctor's behind-origin message: "<surface>: N merged commit(s)
+# not pulled into the live checkout ...". Its other critical conditions (live
+# checkout on the wrong branch) are genuine and still page.
+_DEPLOY_DRIFT_LAG = re.compile(r"merged commit\(s\) not pulled", re.IGNORECASE)
+
+# Noisy pattern-hit finding classes that never page #alerts, whatever their
+# severity: they recur as routine and are read in their resident channel.
+# Explicit by type (and sub-kind) so every other high/critical finding —
+# Sentinel verdict_shift / coordinated_degradation (sentinel_finding),
+# forced-release alarms (sentinel_alarm_finding, alarm_kind=ad_hoc), the Lumen
+# check-in doctor, Vigil service-down, lease-plane health, bridge liveness —
+# keeps reaching the operator. Producers: unitares agents/watcher,
+# agents/sentinel/forced_release_alarm.py, scripts/ops/deploy_drift_doctor.py.
+_FINDING_ALERT_EXCLUSIONS: dict[str, Callable[[dict], bool]] = {
+    # Watcher pattern hits (P0xx rules over source files): ~4/day at "high".
+    "watcher_finding": lambda e: True,
+    # Batched held-by-other lease conflicts; forced releases still page.
+    "sentinel_alarm_finding": lambda e: str(e.get("alarm_kind") or "") == "conflict_batch",
+    # Deploy mirror lag (merged commits not yet pulled into a live checkout).
+    "deploy_drift_finding": lambda e: bool(_DEPLOY_DRIFT_LAG.search(str(e.get("message") or ""))),
+}
+
+
+def is_noisy_finding_class(event: dict) -> bool:
+    """True for a finding class listed in ``_FINDING_ALERT_EXCLUSIONS``."""
+    rule = _FINDING_ALERT_EXCLUSIONS.get(str(event.get("type") or "").strip().lower())
+    return bool(rule and rule(event))
+
+
 def finding_needs_operator(event: dict) -> bool:
     """Should this finding go to #alerts instead of its resident channel?
 
-    Findings post once, to one channel. Only severities in
-    ``config.FINDING_ALERT_SEVERITIES`` (default: critical) reach #alerts; a
-    resolution never does, because it reports something already closed.
+    Findings post once, to one channel. Severities in
+    ``config.FINDING_ALERT_SEVERITIES`` (default: high, critical) reach
+    #alerts unless the finding is a noisy pattern-hit class; a resolution
+    never does, because it reports something already closed.
     """
     if not is_finding_event(event) or is_resolution_finding(event):
         return False
-    return str(event.get("severity") or "").strip().lower() in config.FINDING_ALERT_SEVERITIES
+    if str(event.get("severity") or "").strip().lower() not in config.FINDING_ALERT_SEVERITIES:
+        return False
+    return not is_noisy_finding_class(event)
 
 
 def finding_destination(

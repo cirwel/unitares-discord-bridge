@@ -135,7 +135,7 @@ def _resident_channels(*names: str) -> dict[str, MagicMock]:
 async def test_finding_routes_to_residents_not_main_feed():
     residents_ch = _make_residents_channel()
     poller, routed = _make_poller(
-        [{"event_id": 1, "type": "sentinel_finding", "severity": "high",
+        [{"event_id": 1, "type": "sentinel_finding", "severity": "medium",
           "message": "m", "agent_id": "s", "agent_name": "S"}],
         residents_channel=residents_ch,
     )
@@ -202,8 +202,8 @@ async def test_drift_alert_routes_to_signals():
 async def test_critical_finding_posts_once_to_alerts_only():
     residents_ch = _make_residents_channel()
     poller, routed = _make_poller(
-        [{"event_id": 1, "type": "watcher_finding", "severity": "critical",
-          "message": "m", "agent_id": "w", "agent_name": "W"}],
+        [{"event_id": 1, "type": "vigil_finding", "severity": "critical",
+          "message": "m", "agent_id": "v", "agent_name": "Vigil"}],
         residents_channel=residents_ch,
     )
     await poller._poll_loop_once()
@@ -292,7 +292,7 @@ async def test_other_residents_still_use_shared_channel():
 
 
 @pytest.mark.asyncio
-async def test_own_channel_high_finding_is_not_mirrored_to_alerts():
+async def test_own_channel_high_finding_goes_to_alerts_instead_not_both():
     poller, routed = _make_poller(
         [{"event_id": 1, "type": "sentinel_finding", "severity": "high",
           "message": "m", "agent_id": "sentinel", "agent_name": "Sentinel"}],
@@ -300,7 +300,7 @@ async def test_own_channel_high_finding_is_not_mirrored_to_alerts():
         resident_channels=_resident_channels("sentinel"),
     )
     await poller._poll_loop_once()
-    assert [name for name, _ in routed] == ["sentinel"]
+    assert [name for name, _ in routed] == ["alerts"]
 
 
 @pytest.mark.asyncio

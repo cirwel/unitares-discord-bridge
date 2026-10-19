@@ -86,11 +86,18 @@ def test_critical_routing_and_receipt_severity_agree(event):
 
 
 @pytest.mark.asyncio
-async def test_ws_high_finding_posts_once_to_its_resident_channel():
+async def test_ws_high_alarm_posts_once_to_alerts():
     sub = _subscriber_with_resident_channels("sentinel")
-    event = {"type": "sentinel_alarm_finding", "severity": "high"}
-    assert await _dispatch_and_collect(sub, event) == ["sentinel"]
+    event = {"type": "sentinel_alarm_finding", "severity": "high", "alarm_kind": "ad_hoc"}
+    assert await _dispatch_and_collect(sub, event) == ["alerts"]
     assert sub._receipt_payload("bridge.delivery", event)["source_severity"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_ws_medium_finding_posts_once_to_its_resident_channel():
+    sub = _subscriber_with_resident_channels("sentinel")
+    event = {"type": "sentinel_alarm_finding", "severity": "medium", "alarm_kind": "conflict_batch"}
+    assert await _dispatch_and_collect(sub, event) == ["sentinel"]
 
 
 @pytest.mark.asyncio
@@ -719,11 +726,11 @@ async def test_ws_finding_without_own_channel_stays_in_signals():
 
 @pytest.mark.asyncio
 async def test_ws_finding_routes_by_severity_not_tags():
-    # Same rule as the REST poller: a "critical" tag on a high-severity
-    # finding does not fan it out to #alerts.
+    # Same rule as the REST poller: a "critical" tag on a medium-severity
+    # finding does not send it to #alerts.
     sub = _subscriber_with_resident_channels("sentinel")
     hit = await _dispatch_and_collect(sub, {
-        "type": "sentinel_finding", "severity": "high",
+        "type": "sentinel_finding", "severity": "medium",
         "agent_id": "sentinel", "agent_label": "Sentinel",
         "tags": ["critical"],
     })

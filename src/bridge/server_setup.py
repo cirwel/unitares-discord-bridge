@@ -15,8 +15,8 @@ CHANNEL_STRUCTURE: dict[str, dict[str, dict[str, str]]] = {
     "GOVERNANCE": {
         "activity": {"type": "text", "topic": "Routine agent activity — resident onboards, idle, lifecycle_created/resumed/archived, knowledge writes"},
         "signals": {"type": "text", "topic": "Diagnostic feed — drift, risk and governance transitions. Start with #alerts for urgent triage; messages here are not a separate task queue."},
-        "alerts": {"type": "text", "topic": "Start here for urgent triage — pauses, stuck/silent-critical agents, critical findings and human-review requests. ✅ means seen, not resolved or approved."},
-        "residents": {"type": "text", "topic": "Resident findings, each posted once here (critical ones go to #alerts instead). Not a separate task queue; ✅ means seen, not resolved."},
+        "alerts": {"type": "text", "topic": "Start here for urgent triage — pauses, stuck/silent-critical agents, high/critical resident alarms and human-review requests. ✅ means seen, not resolved or approved."},
+        "residents": {"type": "text", "topic": "Resident findings, each posted once here (high/critical alarms go to #alerts instead). Not a separate task queue; ✅ means seen, not resolved."},
         "governance-hud": {"type": "text", "topic": "Auto-updating system status"},
     },
     "LUMEN": {
@@ -90,7 +90,7 @@ def _resident_finding_channels(
         out[key] = {
             "type": "text",
             "topic": f"{key.replace('-', ' ').title()} findings only, each posted once — "
-                     "critical ones go to #alerts instead. Not a separate task queue.",
+                     "high/critical alarms go to #alerts instead. Not a separate task queue.",
         }
     return out
 

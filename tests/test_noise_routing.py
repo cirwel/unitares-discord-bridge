@@ -90,11 +90,40 @@ async def test_agent_new_for_resident_still_posts_to_activity():
 
 
 @pytest.mark.asyncio
-async def test_critical_risk_threshold_for_ephemeral_session_skips_signals_and_alerts():
+async def test_critical_risk_threshold_for_ephemeral_session_still_reaches_alerts():
+    # Critical events are never silently dropped: the non-resident filter
+    # only skips the routine #signals copy.
     event = _ev("risk_threshold", "claude-9", severity="critical", value=0.72, direction="up")
     poller, routed = _poller([event], tags=_Tags({"claude-9": EPHEMERAL}))
     await poller._poll_loop_once()
+    assert routed == ["alerts"]
+    assert all(r["event_type"] != "bridge.suppressed" for r in _receipts(poller))
+
+
+@pytest.mark.asyncio
+async def test_warning_risk_threshold_for_ephemeral_session_is_suppressed():
+    event = _ev("risk_threshold", "claude-9", severity="warning", value=0.61, direction="up")
+    poller, routed = _poller([event], tags=_Tags({"claude-9": EPHEMERAL}))
+    await poller._poll_loop_once()
     assert routed == []
+    assert _receipts(poller)[0]["reason"] == "non_resident_agent"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tags", [frozenset(), frozenset({"explorer"})])
+async def test_empty_or_unlabelled_tags_post_as_before(tags):
+    # Only a POSITIVE `ephemeral` answer suppresses.
+    poller, routed = _poller([_ev("agent_new", "new-agent")], tags=_Tags({"new-agent": tags}))
+    await poller._poll_loop_once()
+    assert routed == ["activity"]
+
+
+@pytest.mark.asyncio
+async def test_resident_tag_wins_over_ephemeral():
+    both = frozenset({"ephemeral", "persistent"})
+    poller, routed = _poller([_ev("agent_new", "odd")], tags=_Tags({"odd": both}))
+    await poller._poll_loop_once()
+    assert routed == ["activity"]
 
 
 @pytest.mark.asyncio
@@ -212,14 +241,95 @@ async def test_dismissed_resolutions_can_be_reenabled(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("severity,expected", [
-    ("medium", ["sentinel"]), ("high", ["sentinel"]), ("critical", ["alerts"]),
+    ("medium", ["sentinel"]), ("high", ["alerts"]), ("critical", ["alerts"]),
 ])
 async def test_sentinel_finding_posts_exactly_once(severity, expected):
-    event = {"event_id": 5, "type": "sentinel_alarm_finding", "severity": severity,
+    event = {"event_id": 5, "type": "sentinel_finding", "severity": severity,
              "message": "m", "agent_id": "sentinel"}
     poller, routed = _poller([event])
     await poller._poll_loop_once()
     assert routed == expected
+
+
+# Genuine alarms, as their producers emit them (unitares agents/sentinel,
+# agents/vigil, scripts/ops/*_doctor.py, bridge_liveness_watchdog.sh).
+_GENUINE_ALARMS = {
+    "sentinel verdict_shift (fleet pause rate)": {
+        "type": "sentinel_finding", "severity": "high", "finding_type": "verdict_shift",
+        "message": "Fleet pause rate 25%"},
+    "sentinel coordinated degradation": {
+        "type": "sentinel_finding", "severity": "high",
+        "finding_type": "coordinated_degradation", "message": "3 agents degrading"},
+    "sentinel forced-release alarm": {
+        "type": "sentinel_alarm_finding", "severity": "high", "alarm_kind": "ad_hoc",
+        "message": "forced release: repo:x (lease 1)"},
+    "lumen check-in doctor outage": {
+        "type": "lumen_checkin_finding", "severity": "critical",
+        "message": "Lumen not checking in — anima_down."},
+    "vigil service down (503)": {
+        "type": "vigil_finding", "severity": "critical", "finding_type": "governance_down",
+        "message": "Governance returned 503"},
+    "lease-plane acquire healthcheck": {
+        "type": "lease_plane_health_finding", "severity": "critical",
+        "message": "lease-plane acquire healthcheck failed"},
+    "bridge liveness watchdog": {
+        "type": "bridge_liveness_finding", "severity": "high",
+        "message": "bridge log stale; restarted"},
+    "deploy drift: live checkout on wrong branch": {
+        "type": "deploy_drift_finding", "severity": "critical",
+        "message": "unitares-deploy: live checkout is on branch 'x', not the expected 'master'"},
+}
+
+_NOISY_CLASSES = {
+    "watcher pattern hit": {
+        "type": "watcher_finding", "severity": "high", "pattern": "P012",
+        "message": "P012 x.py:12 — unvalidated parse"},
+    "watcher pattern hit at critical": {
+        "type": "watcher_finding", "severity": "critical", "pattern": "P001",
+        "message": "P001 y.py:3"},
+    "sentinel held-by-other lease conflicts": {
+        "type": "sentinel_alarm_finding", "severity": "high", "alarm_kind": "conflict_batch",
+        "message": "held-by-other conflicts: repo:x (count=4)"},
+    "deploy-drift mirror lag": {
+        "type": "deploy_drift_finding", "severity": "critical",
+        "message": "unitares-governance-plugin: 2 merged commit(s) not pulled into the live checkout: abc"},
+    "watcher resolution": {
+        "type": "watcher_resolution_finding", "severity": "critical", "action": "confirmed",
+        "message": "[confirmed] P012"},
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", sorted(_GENUINE_ALARMS))
+async def test_genuine_alarm_reaches_alerts_once(name):
+    poller, routed = _poller([{"event_id": 9, **_GENUINE_ALARMS[name]}])
+    await poller._poll_loop_once()
+    assert routed == ["alerts"], name
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", sorted(_NOISY_CLASSES))
+async def test_noisy_class_never_reaches_alerts(name):
+    poller, routed = _poller([{"event_id": 9, **_NOISY_CLASSES[name]}])
+    await poller._poll_loop_once()
+    assert "alerts" not in routed, name
+    assert len(routed) == 1  # still posted once, to its resident channel
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", sorted(_GENUINE_ALARMS))
+async def test_genuine_alarm_reaches_alerts_via_ws(name):
+    from bridge.ws_events import WSEventSubscriber
+
+    sub = WSEventSubscriber(
+        "http://localhost:8767", _channel("activity"), _channel("signals"), _channel("alerts"),
+        resident_channels={"sentinel": _channel("sentinel")}, residents_channel=_channel("residents"),
+    )
+    await sub._dispatch({"event_id": 9, **_GENUINE_ALARMS[name]})
+    hit = []
+    while not sub._send_queue.empty():
+        hit.append(sub._send_queue.get_nowait()[0].name)
+    assert hit == ["alerts"], name
 
 
 # --- AgentTagResolver -------------------------------------------------------------
@@ -244,17 +354,49 @@ async def test_resolver_reads_tags_from_agent_get_and_caches():
     resolver = AgentTagResolver(gov)
     assert await resolver.tags("uuid-1") == frozenset({"persistent", "embodied"})
     assert await resolver.tags("uuid-1") == frozenset({"persistent", "embodied"})
+    # Untracked side path: never moves the "Governance MCP Unreachable" counter.
     gov.call_tool.assert_awaited_once_with(
         "agent", {"action": "get", "agent_id": "uuid-1", "lite": True},
+        track_failures=False,
     )
 
 
+def _clock(monkeypatch):
+    import bridge.agent_tags as mod
+
+    now = [1000.0]
+    monkeypatch.setattr(mod.time, "monotonic", lambda: now[0])
+    return now
+
+
 @pytest.mark.asyncio
-async def test_resolver_failure_is_unknown_and_not_cached():
+async def test_resolver_failure_is_negative_cached_briefly(monkeypatch):
+    now = _clock(monkeypatch)
     gov = _gov_returning(None, _reply({"success": True, "agent_id": "uuid-1", "tags": ["ephemeral"]}))
-    resolver = AgentTagResolver(gov)
+    resolver = AgentTagResolver(gov, failure_ttl=60)
     assert await resolver.tags("uuid-1") is None
+    now[0] += 30
+    assert await resolver.tags("uuid-1") is None  # remembered, not re-asked
+    assert gov.call_tool.await_count == 1
+    now[0] += 31
     assert await resolver.tags("uuid-1") == frozenset({"ephemeral"})
+
+
+@pytest.mark.asyncio
+async def test_resolver_nonresident_answers_expire_fast_resident_slow(monkeypatch):
+    now = _clock(monkeypatch)
+    gov = _gov_returning(
+        _reply({"success": True, "tags": ["ephemeral"]}),
+        _reply({"success": True, "tags": ["persistent"]}),
+        _reply({"success": True, "tags": ["ephemeral"]}),
+    )
+    resolver = AgentTagResolver(gov, ttl=3600, nonresident_ttl=300)
+    assert await resolver.tags("a") == frozenset({"ephemeral"})
+    now[0] += 301  # non-resident answer is stale after 5 min
+    assert await resolver.tags("a") == frozenset({"persistent"})
+    now[0] += 3000  # resident answer still trusted inside the hour
+    assert await resolver.tags("a") == frozenset({"persistent"})
+    assert gov.call_tool.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -268,22 +410,6 @@ async def test_resolver_rejects_an_answer_about_a_different_agent():
     # `get` defaults to the caller; the bridge's own record must not stand in.
     gov = _gov_returning(_reply({"success": True, "agent_id": "bridge-uuid", "tags": ["ephemeral"]}))
     assert await AgentTagResolver(gov).tags("uuid-1") is None
-
-
-@pytest.mark.asyncio
-async def test_resolver_expires_entries(monkeypatch):
-    import bridge.agent_tags as mod
-
-    now = [1000.0]
-    monkeypatch.setattr(mod.time, "monotonic", lambda: now[0])
-    gov = _gov_returning(
-        _reply({"success": True, "tags": ["ephemeral"]}),
-        _reply({"success": True, "tags": ["persistent"]}),
-    )
-    resolver = AgentTagResolver(gov, ttl=60)
-    assert await resolver.tags("a") == frozenset({"ephemeral"})
-    now[0] += 61
-    assert await resolver.tags("a") == frozenset({"persistent"})
 
 
 @pytest.mark.asyncio
