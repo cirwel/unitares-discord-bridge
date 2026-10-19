@@ -190,8 +190,8 @@ async def on_ready():
 
         # Build the per-class channel map for the WS subscriber. Keys are
         # class ids (e.g. "INT"), values are Discord TextChannel objects.
-        # Empty dict when class routing is disabled — subscriber falls back
-        # to posting to #events only.
+        # Empty dict when class routing is disabled — events then post only
+        # to #activity/#signals, with no class mirror.
         class_channels: dict[str, discord.TextChannel] = {}
         if taxonomy:
             for cls in taxonomy.get("classes") or []:
@@ -241,7 +241,7 @@ async def on_ready():
         log.info(
             "WS event subscriber started (class routing: %s; phase-B channel: %s)",
             f"{len(class_channels)} classes" if class_channels else "disabled",
-            "configured" if phase_b_ch else "disabled",
+            f"#{phase_b_ch.name} ({phase_b_ch.id})" if phase_b_ch else "disabled",
         )
 
     # Start the HUD updater if the channel exists

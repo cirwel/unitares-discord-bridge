@@ -41,7 +41,7 @@ def build_digest_embed(
 
     The digest intentionally reports only in terms of violation classes (not
     individual event types) because a per-type breakdown just duplicates the
-    main #events feed. The class rollup is the new signal.
+    #activity and #signals feeds. The class rollup is the new signal.
     """
     class_meta = class_meta or {}
 

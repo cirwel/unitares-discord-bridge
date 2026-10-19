@@ -187,6 +187,28 @@ def _truncate(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+# Lease-plane Phase B promotion transitions (Sentinel). Governance's finding
+# route accepts only `*_finding` types, so `lease_plane_phase_b_transition` is
+# rejected at ingest; `lease_plane_phase_b_finding` is the name that can
+# arrive. Both render the same way and both go to the Phase B channel.
+PHASE_B_TYPES = frozenset({
+    "lease_plane_phase_b_transition",
+    "lease_plane_phase_b_finding",
+})
+
+
+def phase_b_title_colour(event: dict) -> tuple[str, discord.Colour]:
+    """Title and colour for a Phase B transition: promotable, regression, or change."""
+    surface_kind = event.get("surface_kind") or "?"
+    promotable_now = event.get("promotable_now")
+    promotable_before = event.get("promotable_before")
+    if promotable_now is True and promotable_before is not True:
+        return f"Phase B PROMOTABLE: {surface_kind}", discord.Colour.green()
+    if promotable_before is True and promotable_now is not True:
+        return f"Phase B regression: {surface_kind}", discord.Colour.red()
+    return f"Phase B criterion change: {surface_kind}", discord.Colour.blurple()
+
+
 def event_to_embed(event: dict) -> discord.Embed:
     """Convert a governance event dict to a Discord embed."""
     severity = attention_severity(event, critical=is_critical_event(event))
@@ -197,7 +219,10 @@ def event_to_embed(event: dict) -> discord.Embed:
     qualifier_key, qualifier = _title_qualifier(event)
     resolution = is_resolution_finding(event)
 
-    if resolution:
+    if event_type in PHASE_B_TYPES:
+        title, colour = phase_b_title_colour(event)
+        qualifier_key = None
+    elif resolution:
         title = f"Resolved · {qualifier}" if qualifier else "Resolved"
         colour = (
             discord.Colour.light_grey() if is_dismissed_resolution(event)
@@ -370,8 +395,9 @@ def is_dismissed_resolution(event: dict) -> bool:
 # checkout on the wrong branch) are genuine and still page.
 _DEPLOY_DRIFT_LAG = re.compile(r"merged commit\(s\) not pulled", re.IGNORECASE)
 
-# Noisy pattern-hit finding classes that never page #alerts, whatever their
-# severity: they recur as routine and are read in their resident channel.
+# Finding classes that never page #alerts, whatever their severity: noisy
+# pattern hits that recur as routine and are read in their resident channel,
+# plus Phase B transitions, which have a channel of their own.
 # Explicit by type (and sub-kind) so every other high/critical finding —
 # Sentinel verdict_shift / coordinated_degradation (sentinel_finding),
 # forced-release alarms (sentinel_alarm_finding, alarm_kind=ad_hoc), the Lumen
@@ -385,6 +411,10 @@ _FINDING_ALERT_EXCLUSIONS: dict[str, Callable[[dict], bool]] = {
     "sentinel_alarm_finding": lambda e: str(e.get("alarm_kind") or "") == "conflict_batch",
     # Deploy mirror lag (merged commits not yet pulled into a live checkout).
     "deploy_drift_finding": lambda e: bool(_DEPLOY_DRIFT_LAG.search(str(e.get("message") or ""))),
+    # Lease-plane Phase B transitions: Sentinel posts a PROMOTABLE flip at
+    # "high", but these are read in their own operator-named channel
+    # (DISCORD_LEASE_PLANE_PHASE_B_CHANNEL_ID), not paged.
+    "lease_plane_phase_b_finding": lambda e: True,
 }
 
 

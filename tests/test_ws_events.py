@@ -624,6 +624,58 @@ def test_phase_b_first_observation_baseline_renders_neutral():
     assert embed.colour == discord.Colour.blurple()
 
 
+@pytest.mark.parametrize("phase_b_type", [
+    "lease_plane_phase_b_transition", "lease_plane_phase_b_finding",
+])
+def test_phase_b_embed_path_renders_both_type_names(phase_b_type):
+    from bridge.embeds import event_to_embed
+
+    event = {
+        "type": phase_b_type, "severity": "high", "agent_name": "Sentinel",
+        "surface_kind": "dialectic", "promotable_now": True, "promotable_before": False,
+        "message": "[lease-plane] dialectic: PROMOTABLE", "fingerprint": "0123456789abcdef",
+    }
+    for embed in (broadcaster_event_to_embed(event), event_to_embed(event)):
+        assert embed.title == "Phase B PROMOTABLE: dialectic"
+        assert embed.colour == discord.Colour.green()
+
+
+def _phase_b_subscriber():
+    sub = _subscriber_with_resident_channels("sentinel")
+    sub.residents_channel = MagicMock(spec=discord.TextChannel)
+    sub.residents_channel.name = "residents"
+    sub.lease_plane_phase_b_channel = MagicMock(spec=discord.TextChannel)
+    sub.lease_plane_phase_b_channel.name = "lease-plane-phase-b"
+    return sub
+
+
+@pytest.mark.asyncio
+async def test_phase_b_transition_mirrors_to_phase_b_channel():
+    hit = await _dispatch_and_collect(_phase_b_subscriber(), {
+        "type": "lease_plane_phase_b_transition", "surface_kind": "file",
+        "promotable_now": False, "promotable_before": False,
+    })
+    assert hit == ["signals", "lease-plane-phase-b"]
+
+
+@pytest.mark.asyncio
+async def test_phase_b_finding_mirrors_to_phase_b_channel_and_never_pages():
+    # A PROMOTABLE flip is posted at "high"; the generic finding rule would
+    # send it to #alerts. It is read in its own channel instead.
+    event = {
+        "type": "lease_plane_phase_b_finding", "severity": "high",
+        "agent_name": "Sentinel", "surface_kind": "dialectic",
+        "promotable_now": True, "promotable_before": False,
+    }
+    hit = await _dispatch_and_collect(_phase_b_subscriber(), event)
+    assert "alerts" not in hit
+    assert hit == ["residents", "lease-plane-phase-b"]
+    assert not is_critical_broadcaster_event(event)
+
+    from bridge.embeds import is_critical_event
+    assert not is_critical_event(event)  # the REST poller's rule agrees
+
+
 def test_phase_b_classified_as_signals():
     """The event type is signals-bucket — operators should see it without
     needing to scroll #activity."""

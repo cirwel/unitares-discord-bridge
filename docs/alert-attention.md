@@ -58,6 +58,9 @@ with `alarm_kind=conflict_batch`), and deploy-drift "merged commit(s) not
 pulled" lag. Genuine alarms (Sentinel verdict shift, coordinated degradation
 and forced release; Lumen check-in outage; Vigil service-down; lease-plane
 health; bridge liveness; a live checkout on the wrong branch) still do.
+Lease-plane Phase B transitions (`lease_plane_phase_b_finding`) never page
+either: they are mirrored to the operator-managed `#lease-plane-phase-b`
+channel (see the README).
 
 WebSocket findings use the same full message/evidence renderer and destination
 rules as polled findings. This avoids the previous pair of a detail-free lowercase

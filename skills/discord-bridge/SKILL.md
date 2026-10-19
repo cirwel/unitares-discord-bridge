@@ -4,7 +4,7 @@ description: >
   Use when setting up or operating the UNITARES Discord bridge — a standalone bot that
   surfaces governance events, agent presence, Lumen's state, and explicit operator
   actions as a living Discord server.
-last_verified: "2026-09-17"
+last_verified: "2026-10-19"
 freshness_days: 14
 source_files:
   - unitares-discord-bridge/src/bridge/bot.py
@@ -14,6 +14,7 @@ source_files:
   - unitares-discord-bridge/src/bridge/hud.py
   - unitares-discord-bridge/src/bridge/lumen.py
   - unitares-discord-bridge/src/bridge/iterations.py
+  - unitares-discord-bridge/src/bridge/ws_events.py
 ---
 
 # Discord Bridge
@@ -36,7 +37,7 @@ The bridge operates across several visible layers:
 4. **Lumen**: Optional physical state, drawings, sensor availability, and weekly Q&A digest from Anima.
 5. **Self-iteration attention**: Read-only, provenance-labeled proposals/reviews/canaries go to `#lumen-iterations`; high-priority items are mirrored to `#signals` and critical ones to `#alerts` as well.
 6. **Class routing / violations**: Typed WebSocket events can be mirrored to class-specific channels when enabled.
-7. **Phase-B lease transitions**: An optional operator-managed channel receives lease-plane transition events.
+7. **Phase-B lease transitions**: An optional operator-managed channel, `#lease-plane-phase-b` (formerly `#dialectic`), receives Sentinel's lease-plane Phase B transitions (`lease_plane_phase_b_finding`, or the older `lease_plane_phase_b_transition`) and never pages `#alerts`. The operator names it; the bridge looks it up by `DISCORD_LEASE_PLANE_PHASE_B_CHANNEL_ID` and never creates, renames or deletes it. It currently has no live producer: governance rejects the `_transition` name Sentinel still sends.
 8. **Acknowledgements**: Configured reactions emit `bridge.ack` receipts that governance joins to the matching `bridge.delivery` record; acknowledgement is never an approval signature.
 
 ## Operator Actions and Authority
@@ -68,6 +69,14 @@ resident split adds `#sentinel` and `#doctor`; optional class routing adds a
 | **CONTROL** | commands, audit-log | Slash-command surface and bot audit trail |
 | **VIOLATIONS** (optional) | `gov-<class-id>` | Per-class subscriptions when taxonomy routing is enabled |
 
+Two channels sit outside the declared structure, and the bridge never creates,
+renames or deletes either:
+
+- `#lease-plane-phase-b` (formerly `#dialectic`) is operator-named and looked
+  up by id; see layer 7 above.
+- `#events` is retired. It was the original all-events feed, has had no posts
+  since 2026-04-17, and is archived read-only.
+
 Channel topics are declared in code and reconciled on startup by default. Set
 `BRIDGE_SYNC_CHANNEL_TOPICS=false` to preserve hand-edited topics.
 
@@ -89,6 +98,7 @@ Important optional configuration:
 | `GOVERNANCE_API_TOKEN` | Bearer credential for governance reads |
 | `GOVERNANCE_OPERATOR_TOKEN` | Separate operator-tier credential; required for the HUD to resolve real per-agent EISV instead of redacted handles |
 | `BRIDGE_RESIDENT_FINDING_CHANNELS` | Dedicated finding channels (default: `sentinel,doctor`; empty restores the shared feed) |
+| `DISCORD_LEASE_PLANE_PHASE_B_CHANNEL_ID` | Id of the operator-managed Phase B channel (`#lease-plane-phase-b`); unset disables the mirror |
 | `LUMEN_SELF_ITERATION_ENABLED` | Enable the read-only attention poller (default: true) |
 | `LUMEN_SELF_ITERATION_POLL_INTERVAL` | Attention polling cadence in seconds (default: 60) |
 | `LUMEN_OFFLINE_MENTION` | User/role mention used only for Lumen offline and recovery transitions; routine posts stay silent |

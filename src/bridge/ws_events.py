@@ -38,8 +38,9 @@ from bridge.cache import FindingDeliveryCache
 from bridge.delivery import DiscordSender
 from bridge.embeds import (
     attention_severity, event_to_embed, finding_destination,
-    finding_needs_operator, is_critical_event, is_dismissed_resolution,
-    is_finding_event, parse_event_timestamp,
+    PHASE_B_TYPES, finding_needs_operator, is_critical_event,
+    is_dismissed_resolution, is_finding_event, parse_event_timestamp,
+    phase_b_title_colour,
 )
 from bridge.mcp_client import GovernanceClient
 
@@ -186,7 +187,9 @@ def broadcaster_event_to_embed(event: dict) -> Optional[discord.Embed]:
     t = event.get("type") or ""
     if not t or t == "eisv_update":
         return None
-    if is_finding_event(event):
+    # Phase B has its own renderer whichever name it arrives under; the
+    # `_finding` one would otherwise take the generic finding path.
+    if is_finding_event(event) and t not in PHASE_B_TYPES:
         return event_to_embed({
             **event,
             "severity": attention_severity(event, critical=is_critical_broadcaster_event(event)),
@@ -253,19 +256,8 @@ def broadcaster_event_to_embed(event: dict) -> Optional[discord.Embed]:
         title = f"Circuit breaker {action}"
         description = event.get("reason") or ""
         colour = discord.Colour.red() if action == "tripped" else discord.Colour.green()
-    elif t == "lease_plane_phase_b_transition":
-        surface_kind = event.get("surface_kind") or "?"
-        promotable_now = event.get("promotable_now")
-        promotable_before = event.get("promotable_before")
-        if promotable_now is True and promotable_before is not True:
-            title = f"Phase B PROMOTABLE: {surface_kind}"
-            colour = discord.Colour.green()
-        elif promotable_before is True and promotable_now is not True:
-            title = f"Phase B regression: {surface_kind}"
-            colour = discord.Colour.red()
-        else:
-            title = f"Phase B criterion change: {surface_kind}"
-            colour = discord.Colour.blurple()
+    elif t in PHASE_B_TYPES:
+        title, colour = phase_b_title_colour(event)
         description = event.get("message") or ""
 
     # Discord embed description cap is 4096 chars; be defensive.
@@ -398,7 +390,7 @@ class WSEventSubscriber:
         self.alerts_channel = alerts_channel
         # Per-class channels: {"INT": channel, "ENT": channel, ...}. When a
         # matched event has a class in this map, it's ALSO posted to that
-        # channel (in addition to the main #events feed). Disabled by passing
+        # channel (in addition to its #activity/#signals post). Disabled by passing
         # None or an empty dict.
         self.class_channels = class_channels or {}
         # Per-resident finding channels: {"sentinel": channel, ...}. A finding
@@ -407,10 +399,10 @@ class WSEventSubscriber:
         # without an entry use the same #residents fallback as REST when wired.
         self.resident_channels = resident_channels or {}
         self.taxonomy_reverse = taxonomy_reverse or {}
-        # Operator-managed channel for lease_plane_phase_b_transition events
-        # emitted by Sentinel after a §6.1 criterion (or overall promotable)
-        # flips status. None disables; events still flow via the default
-        # activity/signals path.
+        # Operator-managed channel (#lease-plane-phase-b, looked up by id) for
+        # the PHASE_B_TYPES events Sentinel emits after a §6.1 criterion (or
+        # overall promotable) flips status. None disables; events still flow
+        # via the default signals/resident-findings path.
         self.lease_plane_phase_b_channel = lease_plane_phase_b_channel
         self.reconnect_initial = reconnect_initial
         self.reconnect_max = reconnect_max
@@ -631,7 +623,7 @@ class WSEventSubscriber:
         # Per-class mirror: when an event maps to a violation class and the
         # bridge has a channel for it, post there too. This is the core value
         # of class routing — operators can subscribe to a subset of classes
-        # without seeing every event in #events.
+        # without reading all of #activity and #signals.
         class_id = resolve_violation_class(event, self.taxonomy_reverse)
         if class_id:
             cls_channel = self.class_channels.get(class_id)
@@ -652,7 +644,7 @@ class WSEventSubscriber:
         # surface_kind over the entire pre-promotion lifetime) but high
         # signal — keep them out of the noisy general feed.
         if (
-            event.get("type") == "lease_plane_phase_b_transition"
+            event.get("type") in PHASE_B_TYPES
             and self.lease_plane_phase_b_channel is not None
         ):
             try:
