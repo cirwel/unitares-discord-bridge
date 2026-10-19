@@ -25,6 +25,9 @@ log = logging.getLogger(__name__)
 
 ATTENTION_SCHEMA = "anima.self_iteration.attention.v1"
 SEEN_CACHE_KEY = "lumen_self_iteration_seen_v1"
+# The open outage notice: {"channel_id", "message_id", "since", "reason"}, or
+# empty once it is closed. Persisted so a restart mid-outage still closes it.
+OUTAGE_CACHE_KEY = "lumen_self_iteration_outage_v1"
 MAX_SEEN_DELIVERIES = 2_000
 _ATTENTION_ID = re.compile(r"si-attn-[0-9a-f]{24}")
 _PRIORITIES = {"critical", "high", "medium", "low"}
@@ -205,6 +208,10 @@ class LumenIterationPoller:
         self._seen_order: list[str] = []
         self._consecutive_failures = 0
         self._unavailable_announced = False
+        # The open outage notice (see OUTAGE_CACHE_KEY), so the recovery can
+        # reply to it in the same channel.
+        self._outage: dict | None = None
+        self._outage_loaded = False
 
     async def start(self) -> None:
         self._task = create_logged_task(self._loop(), name="lumen-self-iteration")
@@ -297,59 +304,151 @@ class LumenIterationPoller:
             # Delivery remains useful if governance receipt storage is down.
             log.debug("Self-iteration delivery receipt failed: %s", exc)
 
-    async def _announce_unavailable(self) -> None:
+    async def _load_outage(self) -> None:
+        """Re-open an outage announced before a restart, so it still gets closed."""
+        if self._outage_loaded:
+            return
+        self._outage_loaded = True
+        try:
+            raw = await self.cache.get_kv(OUTAGE_CACHE_KEY)
+            data = json.loads(raw) if raw else None
+        except Exception as exc:
+            log.warning("Self-iteration outage cache unreadable: %s", exc)
+            return
+        if isinstance(data, dict):
+            self._outage = data
+            self._unavailable_announced = True
+
+    async def _store_outage(self, value: dict | None) -> None:
+        self._outage = value
+        try:
+            await self.cache.set_kv(
+                OUTAGE_CACHE_KEY, json.dumps(value) if value else ""
+            )
+        except Exception as exc:
+            # This process still closes the outage; only a restart would lose it.
+            log.warning("Could not persist self-iteration outage state: %s", exc)
+
+    @staticmethod
+    def _failure_reason(projection: object) -> str | None:
+        """Why a projection is unusable, or None when it is usable."""
+        if projection is None:
+            return "no response from Anima"
+        if not isinstance(projection, dict):
+            return f"unexpected response type {type(projection).__name__}"
+        schema = projection.get("schema")
+        if schema != ATTENTION_SCHEMA:
+            return f"schema mismatch (got {_text(schema, limit=80)})"
+        if (
+            projection.get("acknowledgement_is_approval") is not False
+            or projection.get("authority_granted") is not False
+        ):
+            return "authority flags not False"
+        return None
+
+    async def _announce_unavailable(self, reason: str) -> None:
         if self.alerts_channel is None or self._unavailable_announced:
             return
+        if reason == "no response from Anima":
+            summary = "The Discord bridge got no response from Anima's attention projection"
+        else:
+            summary = "The Discord bridge rejected Anima's attention projection"
         embed = discord.Embed(
             title="Lumen self-iteration attention unavailable",
             description=(
-                "The Discord bridge could not read Anima's server-derived attention "
-                "projection twice in succession. No approval state was changed."
+                f"{summary} on two consecutive polls. "
+                "No approval state was changed."
             ),
             colour=discord.Colour.dark_red(),
             timestamp=datetime.now(timezone.utc),
         )
+        embed.add_field(name="Cause", value=reason, inline=False)
         try:
-            await send_with_retry(
+            message = await send_with_retry(
                 lambda: self.alerts_channel.send(embed=embed),
                 what="self-iteration outage notice",
             )
-            self._unavailable_announced = True
         except _SEND_ERRORS as exc:
             # Not announced, so the next failing poll tries again.
             log.warning("Failed to announce self-iteration outage: %s", exc)
+            return
+        self._unavailable_announced = True
+        message_id = getattr(message, "id", None)
+        await self._store_outage(
+            {
+                "channel_id": self._channel_key_int(self.alerts_channel),
+                "message_id": message_id if isinstance(message_id, int) else None,
+                "since": datetime.now(timezone.utc).isoformat(),
+                "reason": reason,
+            }
+        )
+
+    @staticmethod
+    def _channel_key_int(channel: discord.TextChannel) -> int | None:
+        identifier = getattr(channel, "id", None)
+        return identifier if isinstance(identifier, int) else None
 
     async def _announce_recovery(self) -> None:
         if not self._unavailable_announced:
             return
+        # Close the outage where it opened: #alerts, as a reply to the notice.
+        channel = self.alerts_channel or self.iterations_channel
+        outage = self._outage or {}
+        description = "The server-derived attention projection is readable again."
+        since = outage.get("since")
+        try:
+            started = datetime.fromisoformat(since) if since else None
+        except (TypeError, ValueError):
+            started = None
+        if started is not None:
+            minutes = max(0, int((datetime.now(timezone.utc) - started).total_seconds() // 60))
+            description += f" The outage notice was open for about {minutes} min."
         embed = discord.Embed(
             title="Lumen self-iteration attention restored",
-            description="The server-derived attention projection is readable again.",
+            description=description,
             colour=discord.Colour.green(),
             timestamp=datetime.now(timezone.utc),
         )
+        kwargs: dict = {}
+        message_id = outage.get("message_id")
+        if (
+            isinstance(message_id, int)
+            and outage.get("channel_id") == self._channel_key_int(channel)
+        ):
+            # fail_if_not_exists=False: a deleted notice still gets a plain post.
+            kwargs["reference"] = discord.MessageReference(
+                message_id=message_id,
+                channel_id=outage["channel_id"],
+                fail_if_not_exists=False,
+            )
         try:
             await send_with_retry(
-                lambda: self.iterations_channel.send(embed=embed),
+                lambda: channel.send(embed=embed, **kwargs),
                 what="self-iteration recovery notice",
             )
         except _SEND_ERRORS as exc:
             log.warning("Failed to announce self-iteration recovery: %s", exc)
             return
         self._unavailable_announced = False
+        await self._store_outage(None)
 
     async def _tick(self) -> None:
         await self._load_seen()
+        await self._load_outage()
         projection = await self.anima.fetch_self_iteration_attention(limit=50)
-        if (
-            projection is None
-            or projection.get("schema") != ATTENTION_SCHEMA
-            or projection.get("acknowledgement_is_approval") is not False
-            or projection.get("authority_granted") is not False
-        ):
+        reason = self._failure_reason(projection)
+        if reason is not None:
             self._consecutive_failures += 1
+            # Once per outage at WARNING; the client already logs each failed
+            # fetch, so repeating this every poll would only add noise.
+            log.log(
+                logging.WARNING if self._consecutive_failures == 2 else logging.DEBUG,
+                "Self-iteration attention unusable (%d in a row): %s",
+                self._consecutive_failures,
+                reason,
+            )
             if self._consecutive_failures >= 2:
-                await self._announce_unavailable()
+                await self._announce_unavailable(reason)
             return
 
         self._consecutive_failures = 0

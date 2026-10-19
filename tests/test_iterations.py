@@ -11,6 +11,8 @@ import pytest
 
 from bridge.iterations import (
     ATTENTION_SCHEMA,
+    OUTAGE_CACHE_KEY,
+    SEEN_CACHE_KEY,
     LumenIterationPoller,
     build_iteration_embed,
     normalize_attention_item,
@@ -62,15 +64,22 @@ class FakeChannel:
         self.name = name
         self.embeds: list[discord.Embed] = []
         self.messages: list[FakeMessage] = []
+        self.send_kwargs: list[dict] = []
 
-    async def send(self, *, embed: discord.Embed):
+    async def send(self, *, embed: discord.Embed, **kwargs):
         self.embeds.append(embed)
+        self.send_kwargs.append(kwargs)
         message = FakeMessage(self.id * 1_000 + len(self.embeds))
         self.messages.append(message)
         return message
 
 
-def make_poller(projection: dict | None, *, cached: str | None = None):
+def make_poller(
+    projection: dict | None,
+    *,
+    cached: str | None = None,
+    kv: dict[str, str] | None = None,
+):
     if projection is not None:
         projection.setdefault("acknowledgement_is_approval", False)
         projection.setdefault("authority_granted", False)
@@ -78,9 +87,17 @@ def make_poller(projection: dict | None, *, cached: str | None = None):
         fetch_self_iteration_attention=AsyncMock(return_value=projection)
     )
     governance = SimpleNamespace(record_bridge_event=AsyncMock(return_value=True))
+    store: dict[str, str] = dict(kv or {})
+    if cached is not None:
+        store[SEEN_CACHE_KEY] = cached
+
+    async def _set_kv(key: str, value: str) -> None:
+        store[key] = value
+
     cache = SimpleNamespace(
-        get_kv=AsyncMock(return_value=cached),
-        set_kv=AsyncMock(),
+        get_kv=AsyncMock(side_effect=lambda key: store.get(key)),
+        set_kv=AsyncMock(side_effect=_set_kv),
+        store=store,
     )
     iterations = FakeChannel(1, "lumen-iterations")
     signals = FakeChannel(2, "signals")
@@ -205,5 +222,106 @@ async def test_projection_outage_is_debounced_and_recovery_announced():
     }
     await poller._tick()
 
-    assert len(iterations.embeds) == 1
-    assert "restored" in iterations.embeds[0].title.lower()
+    # Closed where it opened: #alerts, replying to the outage notice.
+    assert iterations.embeds == []
+    assert len(alerts.embeds) == 2
+    assert "restored" in alerts.embeds[1].title.lower()
+    reference = alerts.send_kwargs[1]["reference"]
+    assert reference.message_id == alerts.messages[0].id
+    assert reference.channel_id == alerts.id
+    assert reference.fail_if_not_exists is False
+
+
+def _usable_projection() -> dict:
+    return {
+        "schema": ATTENTION_SCHEMA,
+        "items": [],
+        "acknowledgement_is_approval": False,
+        "authority_granted": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_outage_notice_names_the_failure_cause():
+    poller, anima, _g, _c, _i, _s, alerts = make_poller(None)
+    await poller._tick()
+    await poller._tick()
+    cause = next(f for f in alerts.embeds[0].fields if f.name == "Cause")
+    assert cause.value == "no response from Anima"
+
+    poller, anima, _g, _c, _i, _s, alerts = make_poller(
+        {"schema": "anima.self_iteration.attention.v2", "items": []}
+    )
+    await poller._tick()
+    await poller._tick()
+    cause = next(f for f in alerts.embeds[0].fields if f.name == "Cause")
+    assert "schema mismatch" in cause.value
+    assert "attention.v2" in cause.value
+    assert "unreachable" not in alerts.embeds[0].description.lower()
+
+    poller, anima, _g, _c, _i, _s, alerts = make_poller(
+        {"schema": ATTENTION_SCHEMA, "items": [], "authority_granted": True}
+    )
+    await poller._tick()
+    await poller._tick()
+    cause = next(f for f in alerts.embeds[0].fields if f.name == "Cause")
+    assert cause.value == "authority flags not False"
+
+
+@pytest.mark.asyncio
+async def test_outage_notice_id_is_persisted_and_cleared_on_recovery():
+    poller, anima, _g, cache, _i, _s, alerts = make_poller(None)
+    await poller._tick()
+    await poller._tick()
+
+    stored = json.loads(cache.store[OUTAGE_CACHE_KEY])
+    assert stored["channel_id"] == alerts.id
+    assert stored["message_id"] == alerts.messages[0].id
+    assert stored["reason"] == "no response from Anima"
+
+    anima.fetch_self_iteration_attention.return_value = _usable_projection()
+    await poller._tick()
+    assert cache.store[OUTAGE_CACHE_KEY] == ""
+
+
+@pytest.mark.asyncio
+async def test_restart_mid_outage_still_closes_the_open_notice():
+    """A restart used to forget the outage and leave the #alerts post open forever."""
+    open_notice = json.dumps(
+        {
+            "channel_id": 3,
+            "message_id": 3001,
+            "since": "2026-10-19T08:00:00+00:00",
+            "reason": "no response from Anima",
+        }
+    )
+    poller, _anima, _g, cache, iterations, _s, alerts = make_poller(
+        _usable_projection(), kv={OUTAGE_CACHE_KEY: open_notice}
+    )
+
+    await poller._tick()
+
+    assert iterations.embeds == []
+    assert len(alerts.embeds) == 1
+    assert "restored" in alerts.embeds[0].title.lower()
+    assert "open for about" in alerts.embeds[0].description
+    assert alerts.send_kwargs[0]["reference"].message_id == 3001
+    assert cache.store[OUTAGE_CACHE_KEY] == ""
+
+    # Closed once, not on every later poll.
+    await poller._tick()
+    assert len(alerts.embeds) == 1
+
+
+@pytest.mark.asyncio
+async def test_restart_mid_outage_does_not_announce_twice():
+    open_notice = json.dumps({"channel_id": 3, "message_id": 3001})
+    poller, _anima, _g, _c, _i, _s, alerts = make_poller(
+        None, kv={OUTAGE_CACHE_KEY: open_notice}
+    )
+
+    await poller._tick()
+    await poller._tick()
+    await poller._tick()
+
+    assert alerts.embeds == []

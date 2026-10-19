@@ -259,6 +259,7 @@ async def on_ready():
         lumen_poller = LumenPoller(
             anima_client, art_ch, sensor_ch, SENSOR_POLL_INTERVAL,
             offline_mention=LUMEN_OFFLINE_MENTION,
+            cache=cache,
         )
         await lumen_poller.start()
         log.info("Lumen poller started")

@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 
 import discord
 
+from bridge.cache import BridgeCache
 from bridge.delivery import send_with_retry
 from bridge.mcp_client import AnimaClient
 from bridge.tasks import cancel_tasks, create_logged_task
@@ -75,11 +76,25 @@ class LumenPoller:
         sensor_interval: int = 300,
         offline_threshold: int = 2,
         offline_mention: str = "",
+        cache: BridgeCache | None = None,
+        card_recent_window: int = 10,
+        card_check_every: int = 6,
     ) -> None:
         self.anima = anima_client
         self.art_channel = art_channel
         self.sensor_channel = sensor_channel
         self.sensor_interval = sensor_interval
+        # Persists the card's message id so a restart edits the same card
+        # instead of posting a fresh one and leaving the old one frozen.
+        self.cache = cache
+        # Keep the card near the bottom of the channel: every Nth successful
+        # tick, re-post it if it is no longer among the last K messages.
+        self.card_recent_window = max(1, card_recent_window)
+        self.card_check_every = max(1, card_check_every)
+        self._ticks_since_card_check = 0
+        # Set by the offline/recovery transitions: the next card goes below
+        # the notice, and the old card is deleted rather than left frozen.
+        self._card_needs_repost = False
         # Prefixed to the offline/recovery posts so they actually notify. A bare
         # embed in a channel is a record, not an alert (see config
         # LUMEN_OFFLINE_MENTION). Empty → unchanged silent behaviour.
@@ -105,6 +120,7 @@ class LumenPoller:
                 self._last_drawing = gallery[0].get("filename")
         except Exception as exc:
             log.warning("Failed to seed last drawing from gallery: %s", exc)
+        await self._restore_sensor_card()
         self._sensor_task = create_logged_task(self._sensor_loop(), name="lumen-sensor")
         self._drawing_task = create_logged_task(self._drawing_loop(), name="lumen-drawing")
 
@@ -163,7 +179,7 @@ class LumenPoller:
                         what="Lumen offline notice",
                     )
                     self._was_offline = True
-                    self._sensor_msg = None
+                    self._card_needs_repost = True
             else:
                 self._consecutive_failures = 0
                 if self._was_offline:
@@ -181,18 +197,91 @@ class LumenPoller:
                         ),
                         what="Lumen recovery notice",
                     )
-                    self._sensor_msg = None
+                    self._card_needs_repost = True
                 self._was_offline = False
-                embed = build_sensor_embed(state)
-                if self._sensor_msg is not None:
-                    try:
-                        await self._sensor_msg.edit(embed=embed)
-                    except discord.NotFound:
-                        self._sensor_msg = await self.sensor_channel.send(embed=embed)
-                else:
-                    self._sensor_msg = await self.sensor_channel.send(embed=embed)
+                await self._update_sensor_card(build_sensor_embed(state))
         except Exception as exc:
             log.error("Sensor loop error: %s", exc)
+
+    # -- Sensor card --------------------------------------------------------
+
+    async def _restore_sensor_card(self) -> None:
+        """Re-attach to the card posted before a restart, if it still exists."""
+        if self.cache is None:
+            return
+        try:
+            cached = await self.cache.get_sensor_message()
+        except Exception as exc:
+            log.warning("Could not read cached sensor card: %s", exc)
+            return
+        if cached is None:
+            return
+        channel_id, message_id = cached
+        if channel_id != getattr(self.sensor_channel, "id", None):
+            log.info("Cached sensor card is in another channel; will post a new one")
+            return
+        try:
+            self._sensor_msg = await self.sensor_channel.fetch_message(message_id)
+            log.info("Restored sensor card %d from cache", message_id)
+        except discord.NotFound:
+            log.info("Cached sensor card %d not found; will post a new one", message_id)
+        except Exception as exc:
+            log.warning("Could not restore sensor card %d: %s", message_id, exc)
+
+    async def _card_is_recent(self, card: discord.Message) -> bool:
+        """True when the card is among the channel's last K messages.
+
+        Fails open (True): a history read error must not churn the card.
+        """
+        try:
+            async for message in self.sensor_channel.history(
+                limit=self.card_recent_window
+            ):
+                if message.id == card.id:
+                    return True
+        except Exception as exc:
+            log.debug("Sensor card history check failed: %s", exc)
+            return True
+        return False
+
+    async def _update_sensor_card(self, embed: discord.Embed) -> None:
+        """Edit the one live card in place; re-post it only when it is buried."""
+        card = self._sensor_msg
+        repost = self._card_needs_repost
+        if card is not None and not repost:
+            try:
+                await card.edit(embed=embed)
+            except discord.NotFound:
+                card = self._sensor_msg = None
+            else:
+                self._ticks_since_card_check += 1
+                if self._ticks_since_card_check < self.card_check_every:
+                    return
+                self._ticks_since_card_check = 0
+                if await self._card_is_recent(card):
+                    return
+                repost = True
+
+        new_card = await self.sensor_channel.send(embed=embed)
+        self._sensor_msg = new_card
+        self._card_needs_repost = False
+        self._ticks_since_card_check = 0
+        if self.cache is not None:
+            try:
+                await self.cache.set_sensor_message(
+                    self.sensor_channel.id, new_card.id
+                )
+            except Exception as exc:
+                log.warning("Could not persist sensor card id: %s", exc)
+        if card is not None and repost:
+            # Only the bot's own previous card; leaving it would show a second,
+            # frozen "Lumen Environment" reading above the live one.
+            try:
+                await card.delete()
+            except discord.NotFound:
+                pass
+            except Exception as exc:
+                log.warning("Could not delete superseded sensor card: %s", exc)
 
     # -- Drawing loop -------------------------------------------------------
 
