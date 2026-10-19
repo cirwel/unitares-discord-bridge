@@ -1,3 +1,5 @@
+import re
+
 import discord
 from bridge.hud import build_hud_embed
 
@@ -76,3 +78,15 @@ def test_hud_agent_without_metrics():
     embed = build_hud_embed(agents, metrics)
     assert "orphan_agent" in embed.description
     assert "1 agents" in embed.footer.text
+
+
+def test_hud_carries_a_real_dated_timestamp():
+    """The HUD is edited in place; without a timestamp it reads as frozen."""
+    for agents in ([], [{"id": "a1", "label": "opus"}]):
+        embed = build_hud_embed(agents, {})
+        assert embed.timestamp is not None
+        assert embed.timestamp.tzinfo is not None
+        assert embed.timestamp.utcoffset().total_seconds() == 0
+        assert re.search(
+            r"Updated \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC$", embed.footer.text
+        )
