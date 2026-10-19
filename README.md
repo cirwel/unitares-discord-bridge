@@ -59,12 +59,18 @@ shown as caller claims, request provenance is not presented as claim truth, and
 independent verification status and effective policy weight are displayed
 separately.
 
+The live HUD and `/status` read the fleet in one call:
+`agent(action="list", include_metrics=true)` returns each agent's EISV with
+its row. Only an observed agent whose row came back without a reading gets a
+per-agent `get_governance_metrics` call; an agent with no state row shows as
+"no state".
+
 `GOVERNANCE_OPERATOR_TOKEN` is separate from `GOVERNANCE_API_TOKEN` and is sent
-as the `X-Unitares-Operator` header. It is what the **live HUD needs to show
-EISV at all**: governance redacts other agents' UUIDs from `list_agents` for
-non-operator callers and substitutes a display handle, and a display handle is
-not a valid `agent_id` for `get_governance_metrics`. Without the operator token
-the HUD lists agents but reports "no state" for every one of them.
+as the `X-Unitares-Operator` header. Governance redacts other agents' UUIDs
+from `list_agents` for non-operator callers and substitutes a display handle,
+and a display handle is not a valid `agent_id` for `get_governance_metrics`.
+Without the operator token the per-agent fallback cannot read anything and
+the bridge logs how many rows were redacted.
 
 ### Delivery retries
 
@@ -122,6 +128,21 @@ channel whose job changes stops advertising the old one. Set
 `BRIDGE_SYNC_CHANNEL_TOPICS=false` to keep hand-edited topics instead. The bot
 needs Manage Channels to rewrite a topic; without it the edit is logged and
 skipped.
+
+### Logging
+
+The bridge logs to stderr unless `BRIDGE_LOG_PATH` names a file. With it set,
+the bridge writes that file itself through a `WatchedFileHandler`, which
+reopens the path after log rotation renames it. A process that only writes to
+the stdout/stderr launchd opened at spawn keeps writing into the renamed
+archive until it restarts. When `BRIDGE_LOG_PATH` is the file launchd's
+`StandardOutPath`/`StandardErrorPath` already point at, move those to a
+separate file, or every line is written twice.
+
+httpx request lines are logged at WARNING and above only. A failing
+governance or Lumen read logs WARNING on the first failure of a streak and on
+every 20th after it, with the exception type, then one INFO line when the
+streak ends.
 
 ## Run
 

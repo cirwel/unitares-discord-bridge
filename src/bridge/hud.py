@@ -163,7 +163,7 @@ class HUDUpdater:
     async def _update_loop(self) -> None:
         while True:
             try:
-                agents = await fetch_agents(self.gov)
+                agents = await fetch_agents(self.gov, with_metrics=True)
                 metrics = await fetch_metrics(self.gov, agents)
                 conn = {
                     "Governance": self.gov.consecutive_failures == 0,
