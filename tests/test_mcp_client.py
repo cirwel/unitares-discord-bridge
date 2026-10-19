@@ -269,6 +269,41 @@ async def test_anima_fetch_self_iteration_attention_rejects_authority_confusion(
     assert result is None
 
 
+@pytest.mark.asyncio
+async def test_anima_read_self_iteration_attention_names_why_it_failed():
+    """Only a transport failure is "no response"; Anima answering is not."""
+    import httpx
+
+    with mock_httpx_client_error("post", httpx.ConnectTimeout("timed out")):
+        _, reason = await AnimaClient("http://x").read_self_iteration_attention()
+    assert reason == "no response from Anima (ConnectTimeout)"
+
+    with mock_httpx_client("post", make_mock_response(status_code=502)):
+        _, reason = await AnimaClient("http://x").read_self_iteration_attention()
+    assert reason == "HTTP 502 from Anima"
+
+    resp = make_mock_response(json_data={"success": False, "error": "nope"})
+    with mock_httpx_client("post", resp):
+        _, reason = await AnimaClient("http://x").read_self_iteration_attention()
+    assert reason == "Anima reported failure: nope"
+
+    resp = make_mock_response(
+        json_data={
+            "success": True,
+            "result": {
+                "schema": "anima.self_iteration.attention.v1",
+                "items": "not-a-list",
+                "acknowledgement_is_approval": False,
+                "authority_granted": False,
+            },
+        }
+    )
+    with mock_httpx_client("post", resp):
+        result, reason = await AnimaClient("http://x").read_self_iteration_attention()
+    assert result is None
+    assert reason == "items missing or not a list"
+
+
 # --- Lifecycle tests ---
 
 @pytest.mark.asyncio

@@ -7,10 +7,11 @@ assignments. No new channel or resident is needed.
 | Existing channel | What it is for | What to do |
 |---|---|---|
 | #alerts | Pauses, stuck/silent-critical agents, high/critical resident alarms, ≥70% risk crossings, human-review requests | Check the named subject, time and evidence; identify one owner for the underlying condition. |
+| #alerts (Lumen self-iteration) | "Lumen self-iteration attention unavailable" after two unusable polls, with its cause as reported by the bridge's Anima client: no response (connection error or timeout), an HTTP error or `success: false` from Anima, or a rejected projection (schema mismatch, malformed items, or authority flags not False). The matching "restored" notice replies to that post in #alerts, including after a bridge restart mid-outage | An unanswered "unavailable" post means the projection is still unusable. This is the attention feed only; Lumen sensor offline/recovery stays in #lumen-sensors. |
 | #signals | Diagnostic transitions such as drift, risk and adjustment, for resident agents | Consult when investigating an alert; not another urgent task queue. |
 | #sentinel, #doctor, #residents | Resident findings, each posted once | Consult the relevant producer. A high/critical alarm goes to #alerts instead of here, not in addition; routine pattern-hit classes stay here at any severity. |
 | #activity, #governance-hud | Routine events (new *resident* agents, archives, knowledge writes) and current reported state | Context, not proof every job completed successfully. |
-| #lumen-sensors | Lumen observations, offline/recovery transitions, and Lumen's own drift-oscillation / trajectory-adjustment chatter | This is still the existing Lumen outage destination; do not assume all Lumen outages appear in #alerts. |
+| #lumen-sensors | One live "Lumen Environment" card (edited in place, kept across restarts, re-posted near the bottom when it scrolls out of the last few messages), offline/recovery transitions, and Lumen's own drift-oscillation / trajectory-adjustment chatter | This is still the existing Lumen outage destination; do not assume all Lumen outages appear in #alerts. |
 | #lumen-iterations | Read-only proposal/review/canary attention | A post or reaction is not a signed review or permission to deploy. |
 
 ## What is deliberately not posted

@@ -242,3 +242,24 @@ class BridgeCache:
             (value,),
         )
         await self._db.commit()
+
+    # -- Lumen sensor card ---------------------------------------------------
+
+    async def get_sensor_message(self) -> tuple[int, int] | None:
+        """Return (channel_id, message_id) for the Lumen sensor card, or None."""
+        raw = await self.get_kv("sensor_message")
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+            return (int(data["channel_id"]), int(data["message_id"]))
+        except (ValueError, TypeError, KeyError) as exc:
+            log.warning("Corrupt sensor_message %r; ignoring: %s", raw, exc)
+            return None
+
+    async def set_sensor_message(self, channel_id: int, message_id: int) -> None:
+        """Store the Lumen sensor card location, mirroring the HUD's."""
+        await self.set_kv(
+            "sensor_message",
+            json.dumps({"channel_id": channel_id, "message_id": message_id}),
+        )

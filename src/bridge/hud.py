@@ -48,9 +48,18 @@ def build_hud_embed(
         Dict keyed by agent id, values are dicts with ``"E"``, ``"I"``,
         ``"S"``, ``"V"``, and ``"verdict"`` keys.
     """
+    # The HUD is one message edited in place, so Discord shows only its
+    # original post date. A real timestamp plus a dated footer is what tells
+    # a reader the numbers are current rather than frozen. The two overlap on
+    # purpose: Discord renders the timestamp in the viewer's local time and
+    # some clients hide it, while the footer keeps an explicit UTC date.
+    # Seconds, because HUD edits can land within the same minute.
+    now = datetime.now(timezone.utc)
+    updated = now.strftime("%Y-%m-%d %H:%M:%S UTC")
     embed = discord.Embed(
         title="UNITARES Governance \u2014 Live",
         colour=discord.Colour.blurple(),
+        timestamp=now,
     )
 
     conn_line = ""
@@ -62,8 +71,7 @@ def build_hud_embed(
 
     if not agents:
         embed.description = "No active agents"
-        now = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-        embed.set_footer(text=f"{conn_line}0 agents | 0 paused | 0 boundary | Updated {now}")
+        embed.set_footer(text=f"{conn_line}0 agents | 0 paused | 0 boundary | Updated {updated}")
         return embed
 
     lines: list[str] = []
@@ -102,11 +110,10 @@ def build_hud_embed(
         )
 
     embed.description = "\n".join(lines)
-    now = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
     footer = f"{conn_line}{len(agents)} agents | {paused} paused | {boundary} boundary"
     if no_state:
         footer += f" | {no_state} no state"
-    embed.set_footer(text=f"{footer} | Updated {now}")
+    embed.set_footer(text=f"{footer} | Updated {updated}")
     return embed
 
 

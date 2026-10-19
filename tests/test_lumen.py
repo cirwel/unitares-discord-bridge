@@ -103,8 +103,9 @@ async def test_sensor_loop_falls_back_on_not_found():
 
 
 @pytest.mark.asyncio
-async def test_sensor_loop_offline_clears_pinned_msg():
-    """After threshold consecutive failures, offline posts a new message and clears _sensor_msg."""
+async def test_sensor_loop_offline_marks_card_for_repost_without_orphaning_it():
+    """Offline posts a notice; the card is re-posted below it on recovery and
+    the old card is deleted, not left frozen above the live one."""
     poller, anima, sensor_ch = _make_poller()
     anima.fetch_state = AsyncMock(return_value=None)
 
@@ -119,8 +120,22 @@ async def test_sensor_loop_offline_clears_pinned_msg():
     # Second consecutive None crosses the threshold.
     await poller._sensor_tick()
     assert poller._was_offline is True
-    assert poller._sensor_msg is None
+    assert poller._card_needs_repost is True
     sensor_ch.send.assert_called_once()
+
+    # Recovery: "Lumen Online", then a fresh card; the old card is deleted.
+    new_card = AsyncMock(spec=discord.Message)
+    sensor_ch.send = AsyncMock(side_effect=[AsyncMock(spec=discord.Message), new_card])
+    anima.fetch_state = AsyncMock(return_value=SAMPLE_STATE)
+    await poller._sensor_tick()
+
+    assert sensor_ch.send.await_count == 2
+    assert sensor_ch.send.call_args_list[0].kwargs["embed"].title == "Lumen Online"
+    assert sensor_ch.send.call_args_list[1].kwargs["embed"].title == "Lumen Environment"
+    assert poller._sensor_msg is new_card
+    existing_msg.edit.assert_not_called()
+    existing_msg.delete.assert_awaited_once()
+    assert poller._card_needs_repost is False
 
 
 @pytest.mark.asyncio
@@ -235,6 +250,184 @@ async def test_unset_mention_keeps_todays_silent_behaviour():
     assert poller._was_offline is True
     assert "content" not in sensor_ch.send.call_args.kwargs
     assert "allowed_mentions" not in sensor_ch.send.call_args.kwargs
+
+
+# ---------------------------------------------------------------------------
+# One live sensor card across restarts and when it scrolls out of view
+# ---------------------------------------------------------------------------
+#
+# The last three "Lumen Environment" posts matched the three bridge restarts
+# exactly: the card id lived only in memory, so every restart (and every
+# offline/online cycle) posted a new card and left the old one frozen.
+
+
+class _History:
+    def __init__(self, messages):
+        self._messages = list(messages)
+
+    def __aiter__(self):
+        return self._gen()
+
+    async def _gen(self):
+        for message in self._messages:
+            yield message
+
+
+def _message(message_id):
+    msg = AsyncMock(spec=discord.Message)
+    msg.id = message_id
+    return msg
+
+
+def _close_loop(coro, name=None):
+    """Stand-in for create_logged_task: start() is tested, the loops are not."""
+    coro.close()
+
+
+def _make_cached_poller(cached=None, **kwargs):
+    anima = AsyncMock()
+    anima.fetch_gallery = AsyncMock(return_value=[])
+    art_ch = AsyncMock(spec=discord.TextChannel)
+    sensor_ch = AsyncMock(spec=discord.TextChannel)
+    sensor_ch.id = 555
+    cache = AsyncMock()
+    cache.get_sensor_message = AsyncMock(return_value=cached)
+    cache.set_sensor_message = AsyncMock()
+    poller = LumenPoller(
+        anima, art_ch, sensor_ch, sensor_interval=0, cache=cache, **kwargs
+    )
+    return poller, anima, sensor_ch, cache
+
+
+@pytest.mark.asyncio
+async def test_card_is_restored_on_start_and_edited_not_reposted():
+    card = _message(42)
+    poller, anima, sensor_ch, cache = _make_cached_poller(cached=(555, 42))
+    sensor_ch.fetch_message = AsyncMock(return_value=card)
+
+    with patch("bridge.lumen.create_logged_task", side_effect=_close_loop):
+        await poller.start()
+    sensor_ch.fetch_message.assert_awaited_once_with(42)
+    assert poller._sensor_msg is card
+
+    sensor_ch.history = MagicMock(return_value=_History([_message(101), card]))
+    anima.fetch_state = AsyncMock(return_value=SAMPLE_STATE)
+    await poller._sensor_tick()
+    card.edit.assert_awaited_once()
+    sensor_ch.send.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_restored_card_buried_during_downtime_moves_on_the_first_tick():
+    """Not card_check_every ticks later: chatter may have buried it while down."""
+    card = _message(42)
+    poller, anima, sensor_ch, cache = _make_cached_poller(
+        cached=(555, 42), card_recent_window=3, card_check_every=6
+    )
+    sensor_ch.fetch_message = AsyncMock(return_value=card)
+    with patch("bridge.lumen.create_logged_task", side_effect=_close_loop):
+        await poller.start()
+
+    sensor_ch.history = MagicMock(
+        return_value=_History([_message(101), _message(102), _message(103)])
+    )
+    new_card = _message(88)
+    sensor_ch.send = AsyncMock(return_value=new_card)
+    anima.fetch_state = AsyncMock(return_value=SAMPLE_STATE)
+    await poller._sensor_tick()
+
+    sensor_ch.history.assert_called_once_with(limit=3)
+    assert poller._sensor_msg is new_card
+    card.delete.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_card_restore_falls_back_to_a_new_post_when_not_found():
+    poller, anima, sensor_ch, cache = _make_cached_poller(cached=(555, 42))
+    sensor_ch.fetch_message = AsyncMock(
+        side_effect=discord.NotFound(MagicMock(), "gone")
+    )
+
+    with patch("bridge.lumen.create_logged_task", side_effect=_close_loop):
+        await poller.start()
+    assert poller._sensor_msg is None
+
+    new_card = _message(77)
+    sensor_ch.send = AsyncMock(return_value=new_card)
+    anima.fetch_state = AsyncMock(return_value=SAMPLE_STATE)
+    await poller._sensor_tick()
+
+    assert poller._sensor_msg is new_card
+    cache.set_sensor_message.assert_awaited_once_with(555, 77)
+
+
+@pytest.mark.asyncio
+async def test_cached_card_in_another_channel_is_ignored():
+    poller, _anima, sensor_ch, _cache = _make_cached_poller(cached=(999, 42))
+    sensor_ch.fetch_message = AsyncMock()
+
+    with patch("bridge.lumen.create_logged_task", side_effect=_close_loop):
+        await poller.start()
+
+    sensor_ch.fetch_message.assert_not_called()
+    assert poller._sensor_msg is None
+
+
+@pytest.mark.asyncio
+async def test_buried_card_is_reposted_on_the_check_tick_only():
+    old_card = _message(42)
+    poller, anima, sensor_ch, cache = _make_cached_poller(
+        card_recent_window=3, card_check_every=2
+    )
+    poller._sensor_msg = old_card
+    anima.fetch_state = AsyncMock(return_value=SAMPLE_STATE)
+    sensor_ch.history = MagicMock(
+        return_value=_History([_message(101), _message(102), _message(103)])
+    )
+    new_card = _message(88)
+    sensor_ch.send = AsyncMock(return_value=new_card)
+
+    await poller._sensor_tick()  # tick 1: edit only, no history read
+    sensor_ch.history.assert_not_called()
+    sensor_ch.send.assert_not_called()
+
+    await poller._sensor_tick()  # tick 2: card not in last 3 -> re-post
+    sensor_ch.history.assert_called_once_with(limit=3)
+    sensor_ch.send.assert_awaited_once()
+    assert poller._sensor_msg is new_card
+    old_card.delete.assert_awaited_once()
+    cache.set_sensor_message.assert_awaited_once_with(555, 88)
+
+
+@pytest.mark.asyncio
+async def test_recent_card_is_left_in_place():
+    card = _message(42)
+    poller, anima, sensor_ch, _cache = _make_cached_poller(
+        card_recent_window=3, card_check_every=1
+    )
+    poller._sensor_msg = card
+    anima.fetch_state = AsyncMock(return_value=SAMPLE_STATE)
+    sensor_ch.history = MagicMock(return_value=_History([_message(101), card]))
+
+    await poller._sensor_tick()
+
+    sensor_ch.send.assert_not_called()
+    card.delete.assert_not_called()
+    assert poller._sensor_msg is card
+
+
+@pytest.mark.asyncio
+async def test_history_read_failure_does_not_churn_the_card():
+    card = _message(42)
+    poller, anima, sensor_ch, _cache = _make_cached_poller(card_check_every=1)
+    poller._sensor_msg = card
+    anima.fetch_state = AsyncMock(return_value=SAMPLE_STATE)
+    sensor_ch.history = MagicMock(side_effect=discord.HTTPException(MagicMock(), "x"))
+
+    await poller._sensor_tick()
+
+    sensor_ch.send.assert_not_called()
+    card.delete.assert_not_called()
 
 
 @pytest.mark.asyncio

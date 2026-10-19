@@ -438,6 +438,38 @@ async def fetch_metrics(
     return metrics
 
 
+ATTENTION_SCHEMA = "anima.self_iteration.attention.v1"
+ATTENTION_NO_RESPONSE = "no response from Anima"
+
+
+def _attention_failure_reason(data: object) -> str | None:
+    """Why a decoded attention response is unusable, or None when it is usable."""
+    if not isinstance(data, dict):
+        return f"unexpected response type {type(data).__name__}"
+    if data.get("success") is not True:
+        error = data.get("error")
+        detail = f": {str(error)[:120]}" if error else ""
+        return f"Anima reported failure{detail}"
+    result = data.get("result")
+    if not isinstance(result, dict):
+        return "result missing or not an object"
+    schema = result.get("schema")
+    if schema != ATTENTION_SCHEMA:
+        return f"schema mismatch (got {str(schema)[:80]})"
+    if not isinstance(result.get("items"), list):
+        return "items missing or not a list"
+    if (
+        result.get("acknowledgement_is_approval") is not False
+        or result.get("authority_granted") is not False
+    ):
+        return (
+            "authority flags not False "
+            f"(acknowledgement_is_approval={result.get('acknowledgement_is_approval')!r}, "
+            f"authority_granted={result.get('authority_granted')!r})"
+        )
+    return None
+
+
 class AnimaClient:
     """Client for the anima-mcp HTTP API.
 
@@ -543,7 +575,19 @@ class AnimaClient:
                 await client.aclose()
 
     async def fetch_self_iteration_attention(self, limit: int = 50) -> dict | None:
+        """The attention projection, or None when it is unusable."""
+        result, _reason = await self.read_self_iteration_attention(limit=limit)
+        return result
+
+    async def read_self_iteration_attention(
+        self, limit: int = 50
+    ) -> tuple[dict | None, str | None]:
         """Read Anima's bounded, non-authoritative attention projection.
+
+        Returns ``(projection, None)`` when the projection is usable, otherwise
+        ``(None, reason)``. The reason says what actually failed, so an outage
+        notice does not call a rejected response "no response". Reasons for
+        transport failures start with ``ATTENTION_NO_RESPONSE``.
 
         The projection is fetched through the existing authenticated REST tool
         adapter. Only the read-only ``attention`` action is used; this client
@@ -551,31 +595,36 @@ class AnimaClient:
         """
         client = self._get_client()
         try:
-            resp = await client.post(
-                "/v1/tools/call",
-                json={
-                    "name": "self_iteration",
-                    "arguments": {"action": "attention", "limit": limit},
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            result = data.get("result") if isinstance(data, dict) else None
-            if (
-                not isinstance(data, dict)
-                or data.get("success") is not True
-                or not isinstance(result, dict)
-                or result.get("schema") != "anima.self_iteration.attention.v1"
-                or not isinstance(result.get("items"), list)
-                or result.get("acknowledgement_is_approval") is not False
-                or result.get("authority_granted") is not False
-            ):
-                log.warning("anima self-iteration attention response is unavailable")
-                return None
-            return result
+            try:
+                resp = await client.post(
+                    "/v1/tools/call",
+                    json={
+                        "name": "self_iteration",
+                        "arguments": {"action": "attention", "limit": limit},
+                    },
+                )
+            except httpx.TransportError as exc:
+                # Connection refused, DNS, timeouts: Anima never answered.
+                reason = f"{ATTENTION_NO_RESPONSE} ({type(exc).__name__})"
+                log.warning("anima fetch_self_iteration_attention failed: %s", exc)
+                return None, reason
+            if resp.status_code >= 400:
+                reason = f"HTTP {resp.status_code} from Anima"
+                log.warning("anima self-iteration attention: %s", reason)
+                return None, reason
+            try:
+                data = resp.json()
+            except ValueError:
+                log.warning("anima self-iteration attention: response is not JSON")
+                return None, "response was not JSON"
+            reason = _attention_failure_reason(data)
+            if reason is not None:
+                log.warning("anima self-iteration attention rejected: %s", reason)
+                return None, reason
+            return data["result"], None
         except Exception as exc:
             log.warning("anima fetch_self_iteration_attention failed: %s", exc)
-            return None
+            return None, f"unexpected error ({type(exc).__name__})"
         finally:
             if self._client is None:
                 await client.aclose()
