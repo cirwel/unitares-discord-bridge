@@ -199,7 +199,7 @@ async def test_drift_alert_routes_to_signals():
 
 
 @pytest.mark.asyncio
-async def test_critical_finding_routes_to_residents_and_alerts():
+async def test_critical_finding_posts_once_to_alerts_only():
     residents_ch = _make_residents_channel()
     poller, routed = _make_poller(
         [{"event_id": 1, "type": "watcher_finding", "severity": "critical",
@@ -207,11 +207,20 @@ async def test_critical_finding_routes_to_residents_and_alerts():
         residents_channel=residents_ch,
     )
     await poller._poll_loop_once()
-    channels_hit = [name for name, _ in routed]
-    assert "residents" in channels_hit
-    assert "alerts" in channels_hit
-    assert "activity" not in channels_hit
-    assert "signals" not in channels_hit
+    assert [name for name, _ in routed] == ["alerts"]
+
+
+@pytest.mark.asyncio
+async def test_high_finding_posts_once_to_resident_channel():
+    # Watcher's routine high-severity pattern hits used to post to #residents
+    # AND #alerts (22 + 22 in five days).
+    poller, routed = _make_poller(
+        [{"event_id": 1, "type": "watcher_finding", "severity": "high",
+          "message": "m", "agent_id": "w", "agent_name": "Watcher"}],
+        residents_channel=_make_residents_channel(),
+    )
+    await poller._poll_loop_once()
+    assert [name for name, _ in routed] == ["residents"]
 
 
 @pytest.mark.asyncio
@@ -283,7 +292,7 @@ async def test_other_residents_still_use_shared_channel():
 
 
 @pytest.mark.asyncio
-async def test_own_channel_finding_still_mirrors_to_alerts():
+async def test_own_channel_high_finding_is_not_mirrored_to_alerts():
     poller, routed = _make_poller(
         [{"event_id": 1, "type": "sentinel_finding", "severity": "high",
           "message": "m", "agent_id": "sentinel", "agent_name": "Sentinel"}],
@@ -291,10 +300,19 @@ async def test_own_channel_finding_still_mirrors_to_alerts():
         resident_channels=_resident_channels("sentinel"),
     )
     await poller._poll_loop_once()
-    channels_hit = [name for name, _ in routed]
-    assert "sentinel" in channels_hit
-    assert "alerts" in channels_hit
-    assert "residents" not in channels_hit
+    assert [name for name, _ in routed] == ["sentinel"]
+
+
+@pytest.mark.asyncio
+async def test_own_channel_critical_finding_goes_to_alerts_instead():
+    poller, routed = _make_poller(
+        [{"event_id": 1, "type": "sentinel_finding", "severity": "critical",
+          "message": "m", "agent_id": "sentinel", "agent_name": "Sentinel"}],
+        residents_channel=_make_residents_channel(),
+        resident_channels=_resident_channels("sentinel"),
+    )
+    await poller._poll_loop_once()
+    assert [name for name, _ in routed] == ["alerts"]
 
 
 @pytest.mark.asyncio

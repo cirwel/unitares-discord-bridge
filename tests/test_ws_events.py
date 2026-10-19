@@ -86,11 +86,19 @@ def test_critical_routing_and_receipt_severity_agree(event):
 
 
 @pytest.mark.asyncio
-async def test_ws_high_finding_reaches_alerts_without_critical_tag():
+async def test_ws_high_finding_posts_once_to_its_resident_channel():
     sub = _subscriber_with_resident_channels("sentinel")
     event = {"type": "sentinel_alarm_finding", "severity": "high"}
-    assert await _dispatch_and_collect(sub, event) == ["sentinel", "alerts"]
+    assert await _dispatch_and_collect(sub, event) == ["sentinel"]
     assert sub._receipt_payload("bridge.delivery", event)["source_severity"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_ws_critical_finding_posts_once_to_alerts():
+    sub = _subscriber_with_resident_channels("sentinel")
+    event = {"type": "sentinel_alarm_finding", "severity": "critical"}
+    assert await _dispatch_and_collect(sub, event) == ["alerts"]
+    assert sub._receipt_payload("bridge.delivery", event)["source_severity"] == "critical"
 
 
 @pytest.mark.asyncio
@@ -710,14 +718,47 @@ async def test_ws_finding_without_own_channel_stays_in_signals():
 
 
 @pytest.mark.asyncio
-async def test_ws_critical_finding_still_mirrors_to_alerts():
+async def test_ws_finding_routes_by_severity_not_tags():
+    # Same rule as the REST poller: a "critical" tag on a high-severity
+    # finding does not fan it out to #alerts.
     sub = _subscriber_with_resident_channels("sentinel")
     hit = await _dispatch_and_collect(sub, {
         "type": "sentinel_finding", "severity": "high",
         "agent_id": "sentinel", "agent_label": "Sentinel",
         "tags": ["critical"],
     })
-    assert hit == ["sentinel", "alerts"]
+    assert hit == ["sentinel"]
+
+
+@pytest.mark.asyncio
+async def test_ws_dismissed_resolution_is_receipted_not_posted():
+    gov = MagicMock()
+    gov.record_bridge_event = AsyncMock(return_value=True)
+    sub = _subscriber_with_resident_channels("sentinel")
+    sub.gov = gov
+    sub.residents_channel = MagicMock(spec=discord.TextChannel)
+    sub.residents_channel.name = "residents"
+    hit = await _dispatch_and_collect(sub, {
+        "type": "watcher_resolution_finding", "severity": "high",
+        "action": "dismissed", "event_id": 14,
+        "message": "[dismissed] P012 foo.py:12",
+    })
+    assert hit == []
+    payload = gov.record_bridge_event.await_args.args[0]
+    assert payload["event_type"] == "bridge.suppressed"
+    assert payload["reason"] == "dismissed_resolution"
+
+
+@pytest.mark.asyncio
+async def test_ws_confirmed_resolution_posts_once_to_resident_channel():
+    sub = _subscriber_with_resident_channels("sentinel")
+    sub.residents_channel = MagicMock(spec=discord.TextChannel)
+    sub.residents_channel.name = "residents"
+    hit = await _dispatch_and_collect(sub, {
+        "type": "watcher_resolution_finding", "severity": "critical",
+        "action": "confirmed",
+    })
+    assert hit == ["residents"]
 
 
 @pytest.mark.asyncio

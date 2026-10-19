@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import discord
 
+from bridge import config
+
 SEVERITY_COLOURS = {
     "info": discord.Colour.blue(),
     "low": discord.Colour.blue(),
@@ -210,6 +212,54 @@ def finding_resident_key(event: dict) -> str | None:
     return None
 
 
+def is_resolution_finding(event: dict) -> bool:
+    """True for a resident's closure of an earlier finding (``*_resolution_finding``)."""
+    return is_finding_event(event) and "_resolution" in str(event.get("type") or "").lower()
+
+
+def is_dismissed_resolution(event: dict) -> bool:
+    """A resolution recording that nothing needs doing (Watcher "[dismissed] ...")."""
+    return (
+        is_resolution_finding(event)
+        and str(event.get("action") or "").strip().lower() == "dismissed"
+    )
+
+
+def finding_needs_operator(event: dict) -> bool:
+    """Should this finding go to #alerts instead of its resident channel?
+
+    Findings post once, to one channel. Only severities in
+    ``config.FINDING_ALERT_SEVERITIES`` (default: critical) reach #alerts; a
+    resolution never does, because it reports something already closed.
+    """
+    if not is_finding_event(event) or is_resolution_finding(event):
+        return False
+    return str(event.get("severity") or "").strip().lower() in config.FINDING_ALERT_SEVERITIES
+
+
+def finding_destination(
+    event: dict,
+    *,
+    alerts_channel,
+    resident_channels: dict,
+    residents_channel,
+):
+    """The single channel a finding is posted to, or ``None`` if not a finding.
+
+    #alerts when it needs the operator; otherwise the author's own channel
+    (Sentinel, Doctor), else the shared #residents feed. ``None`` is also
+    returned when neither resident channel exists, so the caller falls back to
+    its ordinary activity/signals routing.
+    """
+    if not is_finding_event(event):
+        return None
+    if finding_needs_operator(event) and alerts_channel is not None:
+        return alerts_channel
+    key = finding_resident_key(event)
+    own = resident_channels.get(key) if key else None
+    return own or residents_channel
+
+
 def classify_rest_event(event: dict) -> str:
     """Return ``"activity"`` for routine REST events, ``"signals"`` otherwise.
 
@@ -222,14 +272,17 @@ def classify_rest_event(event: dict) -> str:
 
 
 def is_critical_event(event: dict) -> bool:
-    """Should this event also be posted to #alerts?"""
+    """Should this event also be posted to #alerts?
+
+    For a finding this means "goes to #alerts" (see
+    :func:`finding_needs_operator`); findings are never mirrored.
+    """
+    if is_finding_event(event):
+        return finding_needs_operator(event)
     severity = event.get("severity")
     if severity == "critical":
         return True
     if event.get("type") == "verdict_change" and event.get("to") in ("pause", "reject"):
-        return True
-    # Findings are high-signal by construction — high severity also pages alerts
-    if event.get("type", "").endswith("_finding") and severity == "high":
         return True
     # A dialectic that has asked for a human is the one event class where the
     # ONLY resolution is a person acting. It carries no `critical` severity, so

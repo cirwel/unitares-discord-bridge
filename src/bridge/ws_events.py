@@ -35,8 +35,9 @@ import websockets.exceptions
 from bridge import config
 from bridge.cache import FindingDeliveryCache
 from bridge.embeds import (
-    attention_severity, event_to_embed, finding_resident_key,
-    is_critical_event, is_finding_event,
+    attention_severity, event_to_embed, finding_destination,
+    finding_needs_operator, is_critical_event, is_dismissed_resolution,
+    is_finding_event,
 )
 from bridge.mcp_client import GovernanceClient
 
@@ -252,7 +253,13 @@ def classify_broadcaster_event(event: dict) -> str:
 
 
 def is_critical_broadcaster_event(event: dict) -> bool:
-    """Also mirror to alerts channel if this fires."""
+    """Also mirror to alerts channel if this fires.
+
+    A finding is never mirrored: this answers whether its one destination is
+    #alerts, by severity alone (the REST twin, :func:`is_critical_event`).
+    """
+    if is_finding_event(event):
+        return finding_needs_operator(event)
     if is_critical_event(event):
         return True
     t = event.get("type") or ""
@@ -448,11 +455,13 @@ class WSEventSubscriber:
             delay = min(delay * 2, self.reconnect_max)
 
     def _resident_channel(self, event: dict) -> Optional[discord.TextChannel]:
-        """Dedicated channel for this finding's author, if it has one."""
-        if not is_finding_event(event):
-            return None
-        key = finding_resident_key(event)
-        return self.resident_channels.get(key) or self.residents_channel
+        """The one channel a finding goes to — the REST poller's rule exactly."""
+        return finding_destination(
+            event,
+            alerts_channel=self.alerts_channel,
+            resident_channels=self.resident_channels,
+            residents_channel=self.residents_channel,
+        )
 
     async def _dispatch(self, event: dict) -> None:
         # Record every typed event (including ones we don't turn into an
@@ -469,6 +478,13 @@ class WSEventSubscriber:
                 "bridge.suppressed",
                 source_event=event,
                 reason="suppressed_event_type",
+            )
+            return
+        if config.SUPPRESS_DISMISSED_RESOLUTIONS and is_dismissed_resolution(event):
+            await self._record_receipt(
+                "bridge.suppressed",
+                source_event=event,
+                reason="dismissed_resolution",
             )
             return
         # Static drift conditions re-fire per check-in; only posts when the
@@ -504,7 +520,9 @@ class WSEventSubscriber:
                 reason="send_queue_full",
             )
             return
-        if is_critical_broadcaster_event(event):
+        # Findings were routed to their one channel above (#alerts when they
+        # need the operator); only non-findings mirror.
+        if not is_finding_event(event) and is_critical_broadcaster_event(event):
             try:
                 self._send_queue.put_nowait((self.alerts_channel, embed, event))
             except asyncio.QueueFull:

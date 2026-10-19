@@ -103,6 +103,61 @@ DRIFT_REPEAT_TYPES = {
     if t.strip()
 }
 
+def _csv_set(name: str, default: str) -> frozenset[str]:
+    """Parse a comma-separated env var into a lowercased set. "" means empty."""
+    return frozenset(
+        t.strip().lower()
+        for t in os.environ.get(name, default).split(",")
+        if t.strip()
+    )
+
+
+# Resident-only event types. agent_new and risk_threshold fire for every
+# short-lived codex/claude session (~72 posts/day, ~40% of all bridge traffic
+# over 14 days, 2026-10). They are posted only when the subject agent carries
+# one of BRIDGE_RESIDENT_AGENT_TAGS, read from governance's own agent record
+# (agent(action="get").tags). Residents carry `persistent` (governance stamps
+# RESIDENT_DEFAULT_TAGS on them); throwaway sessions carry `ephemeral`. An
+# agent whose tags cannot be read is posted as before: an unreachable lookup
+# must not hide a real signal. Set the event-type list to "" to disable.
+RESIDENT_ONLY_EVENT_TYPES = _csv_set(
+    "BRIDGE_RESIDENT_ONLY_EVENT_TYPES", "agent_new,risk_threshold"
+)
+RESIDENT_AGENT_TAGS = _csv_set(
+    "BRIDGE_RESIDENT_AGENT_TAGS", "persistent,protected,embodied"
+)
+
+# Embodied-agent state chatter. drift_oscillation (governance's detector calls
+# it self-correcting) and trajectory_adjustment for an embodied agent (Lumen)
+# go to the Lumen channel family instead of #signals. Capability, not name:
+# the subject agent must carry one of BRIDGE_EMBODIED_AGENT_TAGS. If the named
+# channel does not exist the events keep their old destination.
+EMBODIED_STATE_EVENT_TYPES = _csv_set(
+    "BRIDGE_EMBODIED_STATE_EVENT_TYPES", "drift_oscillation,trajectory_adjustment"
+)
+EMBODIED_AGENT_TAGS = _csv_set("BRIDGE_EMBODIED_AGENT_TAGS", "embodied")
+EMBODIED_STATE_CHANNEL = os.environ.get(
+    "BRIDGE_EMBODIED_STATE_CHANNEL", "lumen-sensors"
+).strip()
+
+# How long a looked-up agent tag set is trusted before it is re-read.
+AGENT_TAGS_TTL_SECONDS = float(os.environ.get("BRIDGE_AGENT_TAGS_TTL_SECONDS", "3600"))
+
+# Resident findings post ONCE to ONE channel. A finding whose severity is in
+# this set goes to #alerts (it needs the operator); every other finding goes to
+# its resident channel only. Before 2026-10 high/critical findings were posted
+# to both, so Watcher's routine high-severity pattern hits doubled in #alerts.
+FINDING_ALERT_SEVERITIES = _csv_set("BRIDGE_FINDING_ALERT_SEVERITIES", "critical")
+
+# A resolution finding whose action is "dismissed" (Watcher's "[dismissed] ..."
+# closures, ~8/day) records that nothing needs doing. It is receipted as
+# suppressed and not posted. Confirmed resolutions still post, to the resident
+# channel only, never #alerts.
+SUPPRESS_DISMISSED_RESOLUTIONS = os.environ.get(
+    "BRIDGE_SUPPRESS_DISMISSED_RESOLUTIONS", "true"
+).lower() in ("1", "true", "yes", "on")
+
+
 def _channel_key(raw: str) -> str:
     """Normalise a resident key into a Discord-legal text channel name."""
     return "-".join(raw.strip().lower().split())
