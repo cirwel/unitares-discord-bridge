@@ -50,9 +50,12 @@ def build_hud_embed(
     """
     # The HUD is one message edited in place, so Discord shows only its
     # original post date. A real timestamp plus a dated footer is what tells
-    # a reader the numbers are current rather than frozen.
+    # a reader the numbers are current rather than frozen. The two overlap on
+    # purpose: Discord renders the timestamp in the viewer's local time and
+    # some clients hide it, while the footer keeps an explicit UTC date.
+    # Seconds, because HUD edits can land within the same minute.
     now = datetime.now(timezone.utc)
-    updated = now.strftime("%Y-%m-%d %H:%M UTC")
+    updated = now.strftime("%Y-%m-%d %H:%M:%S UTC")
     embed = discord.Embed(
         title="UNITARES Governance \u2014 Live",
         colour=discord.Colour.blurple(),

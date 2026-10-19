@@ -88,5 +88,5 @@ def test_hud_carries_a_real_dated_timestamp():
         assert embed.timestamp.tzinfo is not None
         assert embed.timestamp.utcoffset().total_seconds() == 0
         assert re.search(
-            r"Updated \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC$", embed.footer.text
+            r"Updated \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC$", embed.footer.text
         )

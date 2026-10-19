@@ -223,6 +223,10 @@ class LumenPoller:
         try:
             self._sensor_msg = await self.sensor_channel.fetch_message(message_id)
             log.info("Restored sensor card %d from cache", message_id)
+            # Chatter may have buried the card while the bridge was down, so
+            # the first successful tick checks history instead of waiting a
+            # full card_check_every cycle.
+            self._ticks_since_card_check = self.card_check_every - 1
         except discord.NotFound:
             log.info("Cached sensor card %d not found; will post a new one", message_id)
         except Exception as exc:

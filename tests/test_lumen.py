@@ -310,10 +310,35 @@ async def test_card_is_restored_on_start_and_edited_not_reposted():
     sensor_ch.fetch_message.assert_awaited_once_with(42)
     assert poller._sensor_msg is card
 
+    sensor_ch.history = MagicMock(return_value=_History([_message(101), card]))
     anima.fetch_state = AsyncMock(return_value=SAMPLE_STATE)
     await poller._sensor_tick()
     card.edit.assert_awaited_once()
     sensor_ch.send.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_restored_card_buried_during_downtime_moves_on_the_first_tick():
+    """Not card_check_every ticks later: chatter may have buried it while down."""
+    card = _message(42)
+    poller, anima, sensor_ch, cache = _make_cached_poller(
+        cached=(555, 42), card_recent_window=3, card_check_every=6
+    )
+    sensor_ch.fetch_message = AsyncMock(return_value=card)
+    with patch("bridge.lumen.create_logged_task", side_effect=_close_loop):
+        await poller.start()
+
+    sensor_ch.history = MagicMock(
+        return_value=_History([_message(101), _message(102), _message(103)])
+    )
+    new_card = _message(88)
+    sensor_ch.send = AsyncMock(return_value=new_card)
+    anima.fetch_state = AsyncMock(return_value=SAMPLE_STATE)
+    await poller._sensor_tick()
+
+    sensor_ch.history.assert_called_once_with(limit=3)
+    assert poller._sensor_msg is new_card
+    card.delete.assert_awaited_once()
 
 
 @pytest.mark.asyncio

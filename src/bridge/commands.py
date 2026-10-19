@@ -28,8 +28,6 @@ def build_status_embed(agents: list[dict], metrics: dict[str, dict]) -> discord.
     from bridge.hud import build_hud_embed
     embed = build_hud_embed(agents, metrics)
     embed.title = "Governance status (snapshot)"
-    if embed.timestamp is None:
-        embed.timestamp = datetime.now(timezone.utc)
     return embed
 
 
