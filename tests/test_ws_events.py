@@ -630,10 +630,9 @@ async def test_ws_send_loop_survives_unexpected_send_error():
     has to drop the poisoned message and keep draining the queue."""
     from bridge.ws_events import WSEventSubscriber
 
-    sub = WSEventSubscriber.__new__(WSEventSubscriber)
-    sub._stop_event = asyncio.Event()
-    sub._send_queue = asyncio.Queue()
-    sub.gov = None  # receipts are best-effort; None skips them
+    ch = MagicMock(spec=discord.TextChannel)
+    sub = WSEventSubscriber("http://localhost:8767", ch, ch, ch)  # gov=None skips receipts
+    sub._sender.pacing = 0
 
     channel = MagicMock(spec=discord.TextChannel)
     channel.name = "signals"
@@ -777,4 +776,5 @@ async def test_ws_non_finding_from_sentinel_is_not_rerouted():
         "type": "lifecycle_paused", "agent_id": "sentinel",
         "agent_label": "Sentinel", "reason": "manual",
     })
-    assert hit == ["signals", "alerts"]
+    # Both destinations; #alerts is dequeued first (express lane).
+    assert sorted(hit) == ["alerts", "signals"]

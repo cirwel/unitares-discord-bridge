@@ -21,6 +21,7 @@ from bridge.embeds import (
     is_dismissed_resolution,
     is_finding_event,
 )
+from bridge.delivery import DiscordSender
 from bridge.mcp_client import GovernanceClient, fetch_agents
 from bridge.tasks import cancel_tasks, create_logged_task
 
@@ -91,9 +92,27 @@ class EventPoller:
         self._task: asyncio.Task | None = None
         self._send_task: asyncio.Task | None = None
         self._gov_alert_sent: bool = False
-        self._message_queue: asyncio.Queue[tuple[discord.TextChannel, discord.Embed, dict | None]] = (
-            asyncio.Queue(maxsize=100)
+        # Shared queue + supervised send loop (bridge/delivery.py): stable
+        # nonces, outage circuit breaker, #alerts express lane. Items put on
+        # the queue are (channel, embed, source_event) tuples.
+        self._sender = DiscordSender(
+            name="event poller",
+            record_receipt=self._record_receipt,
+            # Same headroom as the WS subscriber: enqueueing never blocks the
+            # poll loop (see _enqueue), so bursts must fit.
+            maxsize=1000,
+            priority_channel=lambda: self.alerts_channel,
+            delivery_cache=delivery_cache,
         )
+
+    @property
+    def _message_queue(self) -> asyncio.Queue:
+        """The sender's queue (kept as an attribute name for callers/tests)."""
+        return self._sender.queue
+
+    @_message_queue.setter
+    def _message_queue(self, queue: asyncio.Queue) -> None:
+        self._sender.queue = queue
 
     def _finding_channel(self, event: dict) -> discord.TextChannel | None:
         """The one channel a finding is posted to, or ``None`` if it isn't one.
@@ -265,7 +284,7 @@ class EventPoller:
                     if self._is_nonresident_subject(event, tags):
                         # Critical (else it was suppressed above): page the
                         # operator once, skip the routine #signals copy.
-                        await self._message_queue.put((self.alerts_channel, embed, event))
+                        await self._enqueue(self.alerts_channel, embed, event)
                         continue
                     target = self._finding_channel(event)
                     if target is None and (
@@ -280,11 +299,11 @@ class EventPoller:
                             self.activity_channel if bucket == "activity"
                             else self.signals_channel
                         )
-                    await self._message_queue.put((target, embed, event))
+                    await self._enqueue(target, embed, event)
                     # A finding already went to its one channel (#alerts when
                     # critical); everything else mirrors critical to #alerts.
                     if not is_finding_event(event) and is_critical_event(event):
-                        await self._message_queue.put((self.alerts_channel, embed, event))
+                        await self._enqueue(self.alerts_channel, embed, event)
                 except Exception as exc:
                     log.error(
                         "Failed to dispatch event %s (type=%s): %s",
@@ -309,14 +328,14 @@ class EventPoller:
                     title="Governance MCP Unreachable",
                     colour=discord.Colour.dark_red(),
                 )
-                await self._message_queue.put((self.alerts_channel, warn, None))
+                await self._enqueue(self.alerts_channel, warn, None)
             elif self.gov.consecutive_failures == 0 and self._gov_alert_sent:
                 self._gov_alert_sent = False
                 recovered = discord.Embed(
                     title="Governance MCP Recovered",
                     colour=discord.Colour.green(),
                 )
-                await self._message_queue.put((self.alerts_channel, recovered, None))
+                await self._enqueue(self.alerts_channel, recovered, None)
         except Exception as exc:
             log.error("Event poll error: %s", exc, exc_info=exc)
 
@@ -375,74 +394,27 @@ class EventPoller:
             )
         )
 
+    async def _enqueue(self, channel, embed, event: dict | None) -> None:
+        """Queue one post without ever blocking the poll loop.
+
+        A blocking put stalled the loop for as long as Discord was down once
+        the queue filled, so the liveness heartbeat went stale (the watchdog
+        restarts the bridge after 180 s) and the restart lost everything
+        queued. An #alerts post evicts the oldest routine post instead of
+        failing (SendQueue); a routine post that finds the queue full is
+        recorded as lost.
+        """
+        try:
+            self._message_queue.put_nowait((channel, embed, event))
+        except asyncio.QueueFull:
+            log.warning("Send queue full; dropping %s post", getattr(channel, "name", "?"))
+            await self._record_receipt(
+                "bridge.delivery_failed",
+                source_event=event,
+                channel=channel,
+                reason="send_queue_full",
+            )
+
     async def _send_loop(self) -> None:
-        while True:
-            channel, embed, source_event = await self._message_queue.get()
-            try:
-                if self.delivery_cache is not None:
-                    message_id, duplicate = await self.delivery_cache.send(channel, embed, source_event)
-                else:
-                    message = await channel.send(embed=embed)
-                    message_id, duplicate = getattr(message, "id", None), False
-                await self._record_receipt(
-                    "bridge.suppressed" if duplicate else "bridge.delivery",
-                    source_event=source_event,
-                    channel=channel,
-                    discord_message_id=message_id,
-                    reason="duplicate_finding_delivery" if duplicate else None,
-                )
-            except discord.RateLimited as exc:
-                # Raised when max_ratelimit_timeout is set and the retry-after exceeds it.
-                # Respect Discord's back-off and re-queue rather than dropping the message.
-                log.warning("Global rate limit hit; retrying in %.1fs", exc.retry_after)
-                await self._record_receipt(
-                    "bridge.rate_limited",
-                    source_event=source_event,
-                    channel=channel,
-                    reason="discord_rate_limited",
-                )
-                await asyncio.sleep(exc.retry_after)
-                await self._message_queue.put((channel, embed, source_event))
-            except discord.HTTPException as exc:
-                if exc.status == 429:
-                    # Per-route 429 that discord.py's internal limiter did not absorb.
-                    # Parse Retry-After from the response headers, fall back to 5 s.
-                    retry_after = float(exc.response.headers.get("Retry-After", 5))
-                    log.warning("Rate limited (HTTP 429); retrying in %.1fs", retry_after)
-                    await self._record_receipt(
-                        "bridge.rate_limited",
-                        source_event=source_event,
-                        channel=channel,
-                        reason="discord_http_429",
-                    )
-                    await asyncio.sleep(retry_after)
-                    await self._message_queue.put((channel, embed, source_event))
-                else:
-                    log.warning("Discord send failed: %s", exc)
-                    await self._record_receipt(
-                        "bridge.delivery_failed",
-                        source_event=source_event,
-                        channel=channel,
-                        reason="discord_http_exception",
-                        error=str(exc),
-                    )
-            except Exception as exc:
-                # Anything not covered above (transport-layer errors, malformed
-                # embed state) must not kill the send loop: the poll loop keeps
-                # running and the heartbeat stays fresh, so a dead sender is a
-                # silent Discord outage the watchdog can't see. Log, record,
-                # drop this message, keep draining the queue.
-                log.error(
-                    "Unexpected send error (%s); dropping message",
-                    exc, exc_info=exc,
-                )
-                await self._record_receipt(
-                    "bridge.delivery_failed",
-                    source_event=source_event,
-                    channel=channel,
-                    reason="send_loop_unexpected_error",
-                    error=str(exc),
-                )
-            # 150 ms pacing between sends to stay well under Discord's per-route burst
-            # limit — this is not a retry delay; rate limit retries are handled above.
-            await asyncio.sleep(0.15)
+        """Drain the send queue (see :class:`bridge.delivery.DiscordSender`)."""
+        await self._sender.run()

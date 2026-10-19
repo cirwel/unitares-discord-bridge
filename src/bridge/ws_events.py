@@ -34,6 +34,7 @@ import websockets.exceptions
 
 from bridge import config
 from bridge.cache import FindingDeliveryCache
+from bridge.delivery import DiscordSender
 from bridge.embeds import (
     attention_severity, event_to_embed, finding_destination,
     finding_needs_operator, is_critical_event, is_dismissed_resolution,
@@ -356,12 +357,28 @@ class WSEventSubscriber:
         self._sub_task: Optional[asyncio.Task] = None
         self._send_task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
-        self._send_queue: asyncio.Queue[tuple[discord.TextChannel, discord.Embed, dict | None]] = (
-            asyncio.Queue(maxsize=_SEND_QUEUE_MAX)
+        # Shared queue + supervised send loop (bridge/delivery.py): stable
+        # nonces, outage circuit breaker, #alerts express lane. Items put on
+        # the queue are (channel, embed, source_event) tuples.
+        self._sender = DiscordSender(
+            name="WS events",
+            record_receipt=self._record_receipt,
+            maxsize=_SEND_QUEUE_MAX,
+            priority_channel=lambda: self.alerts_channel,
+            delivery_cache=delivery_cache,
         )
         # (event_type, agent_id) -> (monotonic ts of last post, metric value)
         # for repeat-drift suppression; see _suppress_repeat_drift().
         self._drift_last: dict[tuple[str, str], tuple[float, Optional[float]]] = {}
+
+    @property
+    def _send_queue(self) -> asyncio.Queue:
+        """The sender's queue (kept as an attribute name for callers/tests)."""
+        return self._sender.queue
+
+    @_send_queue.setter
+    def _send_queue(self, queue: asyncio.Queue) -> None:
+        self._sender.queue = queue
 
     def _suppress_repeat_drift(self, event: dict) -> bool:
         """True when a drift event repeats a recently-posted one for its agent.
@@ -519,7 +536,8 @@ class WSEventSubscriber:
                 channel=target,
                 reason="send_queue_full",
             )
-            return
+            # No return: the #alerts mirror below can still evict a routine
+            # post (SendQueue) and must not be lost with the routine copy.
         # Findings were routed to their one channel above (#alerts when they
         # need the operator); only non-findings mirror.
         if not is_finding_event(event) and is_critical_broadcaster_event(event):
@@ -627,88 +645,5 @@ class WSEventSubscriber:
         )
 
     async def _send_loop(self) -> None:
-        while not self._stop_event.is_set():
-            try:
-                channel, embed, source_event = await self._send_queue.get()
-            except asyncio.CancelledError:
-                raise
-            try:
-                if getattr(self, "delivery_cache", None) is not None:
-                    message_id, duplicate = await self.delivery_cache.send(channel, embed, source_event)
-                else:
-                    message = await channel.send(embed=embed)
-                    message_id, duplicate = getattr(message, "id", None), False
-                await self._record_receipt(
-                    "bridge.suppressed" if duplicate else "bridge.delivery",
-                    source_event=source_event,
-                    channel=channel,
-                    discord_message_id=message_id,
-                    reason="duplicate_finding_delivery" if duplicate else None,
-                )
-            except discord.RateLimited as exc:
-                log.warning("WS events: rate limited, retry in %.1fs",
-                            exc.retry_after)
-                await self._record_receipt(
-                    "bridge.rate_limited",
-                    source_event=source_event,
-                    channel=channel,
-                    reason="discord_rate_limited",
-                )
-                await asyncio.sleep(exc.retry_after)
-                try:
-                    self._send_queue.put_nowait((channel, embed, source_event))
-                except asyncio.QueueFull:
-                    await self._record_receipt(
-                        "bridge.delivery_failed",
-                        source_event=source_event,
-                        channel=channel,
-                        reason="send_queue_full",
-                    )
-            except discord.HTTPException as exc:
-                if exc.status == 429:
-                    retry = float(exc.response.headers.get("Retry-After", 5))
-                    await self._record_receipt(
-                        "bridge.rate_limited",
-                        source_event=source_event,
-                        channel=channel,
-                        reason="discord_http_429",
-                    )
-                    await asyncio.sleep(retry)
-                    try:
-                        self._send_queue.put_nowait((channel, embed, source_event))
-                    except asyncio.QueueFull:
-                        await self._record_receipt(
-                            "bridge.delivery_failed",
-                            source_event=source_event,
-                            channel=channel,
-                            reason="send_queue_full",
-                        )
-                else:
-                    log.warning("WS events: discord send failed (%s)", exc)
-                    await self._record_receipt(
-                        "bridge.delivery_failed",
-                        source_event=source_event,
-                        channel=channel,
-                        reason="discord_http_exception",
-                        error=str(exc),
-                    )
-            except Exception as exc:
-                # Anything not covered above (transport-layer errors, malformed
-                # embed state) must not kill the send loop: the poll/subscribe
-                # side keeps running and the heartbeat stays fresh, so a dead
-                # sender is a silent Discord outage the watchdog can't see.
-                # Log, record, drop this message, keep draining the queue.
-                log.error(
-                    "WS events: unexpected send error (%s); dropping message",
-                    exc, exc_info=exc,
-                )
-                await self._record_receipt(
-                    "bridge.delivery_failed",
-                    source_event=source_event,
-                    channel=channel,
-                    reason="send_loop_unexpected_error",
-                    error=str(exc),
-                )
-            # 150 ms pacing between sends — matches event_poller to stay
-            # well under Discord's per-route burst limits.
-            await asyncio.sleep(0.15)
+        """Drain the send queue (see :class:`bridge.delivery.DiscordSender`)."""
+        await self._sender.run()
