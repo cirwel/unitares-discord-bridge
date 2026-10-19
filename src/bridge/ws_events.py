@@ -592,6 +592,17 @@ class WSEventSubscriber:
         resident_ch = self._resident_channel(event)
         if resident_ch is not None:
             target = resident_ch
+        # Lease-plane Phase B transitions: the narrow stream of "criterion N
+        # flipped" / "PROMOTABLE" / "REGRESSED" posts Sentinel emits. Low
+        # volume (<=5 per surface_kind over the pre-promotion lifetime) but
+        # high signal, so when the operator has wired a channel for them it is
+        # their one destination, in place of #residents/#signals. Unset, they
+        # take the ordinary route above.
+        if (
+            event.get("type") in PHASE_B_TYPES
+            and self.lease_plane_phase_b_channel is not None
+        ):
+            target = self.lease_plane_phase_b_channel
         try:
             self._send_queue.put_nowait((target, embed, event))
         except asyncio.QueueFull:
@@ -637,27 +648,6 @@ class WSEventSubscriber:
                         channel=cls_channel,
                         reason="send_queue_full",
                     )
-
-        # Lease-plane Phase B transition mirror: a dedicated channel for the
-        # narrow stream of "criterion N flipped" / "PROMOTABLE" / "REGRESSED"
-        # findings emitted by Sentinel. Low volume (≤5 messages per
-        # surface_kind over the entire pre-promotion lifetime) but high
-        # signal — keep them out of the noisy general feed.
-        if (
-            event.get("type") in PHASE_B_TYPES
-            and self.lease_plane_phase_b_channel is not None
-        ):
-            try:
-                self._send_queue.put_nowait(
-                    (self.lease_plane_phase_b_channel, embed, event)
-                )
-            except asyncio.QueueFull:
-                await self._record_receipt(
-                    "bridge.delivery_failed",
-                    source_event=event,
-                    channel=self.lease_plane_phase_b_channel,
-                    reason="send_queue_full",
-                )
 
     def _receipt_payload(
         self,

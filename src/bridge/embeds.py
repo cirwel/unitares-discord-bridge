@@ -166,6 +166,7 @@ def _title_qualifier(event: dict) -> tuple[str, str] | tuple[None, None]:
 
 
 _HOME_PREFIX = re.compile(r"^/(?:Users|home)/[^/]+/")
+_HOME_PROJECTS = re.compile(r"^/(?:Users|home)/[^/]+/projects/(?:wt/)?(.+)")
 
 
 def short_path(path: str) -> str:
@@ -173,14 +174,29 @@ def short_path(path: str) -> str:
 
     ``/Users/x/projects/unitares/src/a.py`` -> ``unitares/src/a.py`` and
     ``/Users/x/projects/wt/unitares-fix/src/a.py`` -> ``unitares-fix/src/a.py``,
-    keeping the checkout name. Other home paths become ``~/...``; anything else
-    is unchanged.
+    keeping the checkout name. Only the home ``projects`` directory counts, so
+    ``~/.claude/projects/...`` keeps its location. Other home paths become
+    ``~/...``; anything else is unchanged.
     """
-    for marker in ("/projects/wt/", "/projects/"):
-        idx = path.find(marker)
-        if idx != -1 and path[idx + len(marker):]:
-            return path[idx + len(marker):]
+    match = _HOME_PROJECTS.match(path)
+    if match:
+        return match.group(1)
     return _HOME_PREFIX.sub("~/", path)
+
+
+def _inline_code(text: str) -> str:
+    """``text`` as a Discord inline code span, safe when it contains a backtick.
+
+    A single-backtick span ends at the first backtick inside it, so free text
+    such as a fingerprint is wrapped in a double-backtick span instead (the
+    padding spaces let it start or end with a backtick). A run of two or more
+    backticks would end that span too, so those become U+02CB lookalikes.
+    """
+    if "`" not in text:
+        return f"`{text}`"
+    if "``" in text:
+        return f"`{text.replace('`', chr(0x2CB))}`"
+    return f"`` {text} ``"
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -263,7 +279,7 @@ def event_to_embed(event: dict) -> discord.Embed:
 
     fingerprint = short_fingerprint(event.get("fingerprint"))
     if fingerprint:
-        embed.add_field(name="Fingerprint", value=f"`{fingerprint}`", inline=True)
+        embed.add_field(name="Fingerprint", value=_inline_code(fingerprint), inline=True)
 
     # Type-specific fields
     if event_type == "verdict_change":
@@ -309,7 +325,10 @@ def event_to_embed(event: dict) -> discord.Embed:
         if event_type == "watcher_finding" and fingerprint and not fingerprint.startswith("…"):
             embed.add_field(
                 name="Close",
-                value=f"`--resolve {fingerprint}` or `--dismiss {fingerprint}`",
+                value=(
+                    f"{_inline_code(f'--resolve {fingerprint}')} or "
+                    f"{_inline_code(f'--dismiss {fingerprint}')}"
+                ),
                 inline=False,
             )
 

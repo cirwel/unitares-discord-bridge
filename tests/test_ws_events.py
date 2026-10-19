@@ -650,16 +650,28 @@ def _phase_b_subscriber():
 
 
 @pytest.mark.asyncio
-async def test_phase_b_transition_mirrors_to_phase_b_channel():
+async def test_phase_b_transition_posts_once_to_phase_b_channel():
     hit = await _dispatch_and_collect(_phase_b_subscriber(), {
         "type": "lease_plane_phase_b_transition", "surface_kind": "file",
         "promotable_now": False, "promotable_before": False,
     })
-    assert hit == ["signals", "lease-plane-phase-b"]
+    assert hit == ["lease-plane-phase-b"]
 
 
 @pytest.mark.asyncio
-async def test_phase_b_finding_mirrors_to_phase_b_channel_and_never_pages():
+async def test_phase_b_takes_the_ordinary_route_without_its_channel():
+    sub = _phase_b_subscriber()
+    sub.lease_plane_phase_b_channel = None
+    event = {
+        "type": "lease_plane_phase_b_finding", "severity": "high",
+        "agent_name": "Sentinel", "surface_kind": "dialectic",
+        "promotable_now": True, "promotable_before": False,
+    }
+    assert await _dispatch_and_collect(sub, event) == ["residents"]
+
+
+@pytest.mark.asyncio
+async def test_phase_b_finding_posts_once_to_phase_b_channel_and_never_pages():
     # A PROMOTABLE flip is posted at "high"; the generic finding rule would
     # send it to #alerts. It is read in its own channel instead.
     event = {
@@ -669,7 +681,7 @@ async def test_phase_b_finding_mirrors_to_phase_b_channel_and_never_pages():
     }
     hit = await _dispatch_and_collect(_phase_b_subscriber(), event)
     assert "alerts" not in hit
-    assert hit == ["residents", "lease-plane-phase-b"]
+    assert hit == ["lease-plane-phase-b"]
     assert not is_critical_broadcaster_event(event)
 
     from bridge.embeds import is_critical_event

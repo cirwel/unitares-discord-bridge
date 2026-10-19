@@ -326,17 +326,23 @@ def _derive_verdict(data: dict) -> str:
     return "guide"
 
 
-async def fetch_agents(gov_client: "GovernanceClient") -> list[dict]:
+async def fetch_agents(
+    gov_client: "GovernanceClient", *, track_failures: bool = True,
+) -> list[dict]:
     """Call agent(action="list") and return normalised list of {"id": ..., "label": ...}.
 
     Sorted by last activity descending (most-recent first). Test agents are
     filtered out by governance's lite mode; we widen the window and re-sort
     locally so the HUD surfaces recent agents instead of "best of the best"
     high-update ones.
+
+    ``track_failures`` is passed to :meth:`GovernanceClient.call_tool`; set it
+    to ``False`` for cosmetic reads that must not move the unreachable alert.
     """
     result = await gov_client.call_tool(
         "agent",
         {"action": "list", "lite": True, "limit": 50, "recent_days": 7},
+        track_failures=track_failures,
     )
     if result is None:
         return []

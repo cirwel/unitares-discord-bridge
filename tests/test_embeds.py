@@ -453,3 +453,29 @@ def test_finding_resident_key_ignores_non_findings():
     assert finding_resident_key({
         "type": "verdict_change", "agent_id": "sentinel",
     }) is None
+
+
+def test_short_path_only_shortens_the_home_projects_directory():
+    from bridge.embeds import short_path
+
+    assert short_path("/Users/x/projects/unitares/src/a.py") == "unitares/src/a.py"
+    assert short_path("/home/x/projects/wt/unitares-fix/a.py") == "unitares-fix/a.py"
+    # A "projects" directory elsewhere keeps its location.
+    assert (
+        short_path("/Users/x/.claude/projects/-Users-x/memory/a.md")
+        == "~/.claude/projects/-Users-x/memory/a.md"
+    )
+    assert short_path("/srv/projects/app/a.py") == "/srv/projects/app/a.py"
+
+
+@pytest.mark.parametrize("fingerprint, rendered", [
+    ("abc`def", "`` abc`def ``"),
+    ("`edge`", "`` `edge` ``"),
+    ("a``b", "`a\u02cb\u02cbb`"),
+])
+def test_fingerprint_with_backticks_keeps_a_valid_code_span(fingerprint, rendered):
+    embed = event_to_embed({
+        "type": "vigil_finding", "severity": "low", "fingerprint": fingerprint,
+        "message": "m",
+    })
+    assert _fields(embed)["Fingerprint"] == rendered

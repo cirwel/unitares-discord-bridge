@@ -1,6 +1,7 @@
 """AgentLabelCache: one agent list per TTL, never one per event."""
 
 import asyncio
+import time
 
 import pytest
 
@@ -17,6 +18,12 @@ class _Clock:
 
 def _cache(fetch, clock=None, **kwargs):
     return AgentLabelCache(object(), fetch=fetch, clock=clock or _Clock(), **kwargs)
+
+
+async def _settle():
+    """Let a background refresh that was started without waiting finish."""
+    for _ in range(3):
+        await asyncio.sleep(0)
 
 
 @pytest.mark.asyncio
@@ -37,6 +44,7 @@ async def test_many_lookups_share_one_fetch_within_ttl():
 
     clock.now += 301
     await cache.label_for("a1")
+    await _settle()
     assert len(calls) == 2
 
 
@@ -65,14 +73,19 @@ async def test_failed_fetch_keeps_last_labels_and_retries_after_failure_ttl():
     cache = _cache(fetch, clock, ttl=300, failure_ttl=60)
     assert await cache.label_for("a1") == "Vigil"
     clock.now += 301
-    assert await cache.label_for("a1") == "Vigil"  # error: old map kept
+    assert await cache.label_for("a1") == "Vigil"  # stale map served at once
+    await _settle()
     assert len(calls) == 2
+    assert await cache.label_for("a1") == "Vigil"  # error: old map kept
     clock.now += 30
     await cache.label_for("a1")
+    await _settle()
     assert len(calls) == 2  # within failure TTL: no retry
     clock.now += 31
-    assert await cache.label_for("a1") == "Vigil"  # empty list: old map kept
+    await cache.label_for("a1")
+    await _settle()
     assert len(calls) == 3
+    assert await cache.label_for("a1") == "Vigil"  # empty list: old map kept
 
 
 @pytest.mark.asyncio
@@ -90,6 +103,62 @@ async def test_slow_governance_does_not_stall_the_caller():
     await asyncio.sleep(0)
     assert await cache.label_for("a1") == "Vigil"
     await cache.close()
+
+
+@pytest.mark.asyncio
+async def test_lookups_during_a_hung_refresh_do_not_each_wait():
+    # One hung refresh must cost the WebSocket reader at most one ``wait`` in
+    # total, not one per event, whether or not a map is cached.
+    release = asyncio.Event()
+    calls = []
+
+    async def hung(_gov):
+        calls.append(1)
+        await release.wait()
+        return [{"id": "a1", "label": "Vigil"}]
+
+    wait = 0.2
+
+    # Never loaded: only the lookup that starts the first load waits.
+    cold = _cache(hung, wait=wait)
+    started = time.monotonic()
+    for _ in range(10):
+        assert await cold.label_for("a1") is None
+        await asyncio.sleep(0)
+    assert time.monotonic() - started < 2 * wait
+    assert len(calls) == 1
+    await cold.close()
+
+    # Loaded but stale: no lookup waits; each gets the cached label.
+    calls.clear()
+    clock = _Clock()
+    warm = _cache(hung, clock, wait=wait, ttl=300)
+    release.set()
+    assert await warm.label_for("a1") == "Vigil"
+    release.clear()
+    clock.now += 301
+    started = time.monotonic()
+    for _ in range(10):
+        assert await warm.label_for("a1") == "Vigil"
+        await asyncio.sleep(0)
+    assert time.monotonic() - started < wait
+    assert len(calls) == 2  # one refresh, shared
+    release.set()
+    await warm.close()
+
+
+@pytest.mark.asyncio
+async def test_default_fetch_does_not_track_governance_failures():
+    seen = []
+
+    class _Gov:
+        async def call_tool(self, name, arguments, *, track_failures=True):
+            seen.append(track_failures)
+            return None
+
+    cache = AgentLabelCache(_Gov(), clock=_Clock())
+    assert await cache.label_for("a1") is None
+    assert seen == [False]
 
 
 @pytest.mark.asyncio

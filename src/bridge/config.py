@@ -239,10 +239,10 @@ CLASS_ROUTING_ENABLED = os.environ.get(
 # transitions emitted by Sentinel (embeds.PHASE_B_TYPES: the
 # lease_plane_phase_b_finding name governance accepts, and the older
 # lease_plane_phase_b_transition). Looked up by id, so the operator may name
-# and rename it freely; it is #lease-plane-phase-b (formerly #dialectic).
-# Empty/0 disables routing — events still flow to the default signals /
-# resident-findings channels via the standard dispatch path. Channel must
-# already exist; the bridge does NOT create, rename or delete it.
+# and rename it freely. When set it is their one destination (WebSocket path);
+# empty/0 sends them to the default signals / resident-findings channels via
+# the standard dispatch path. Channel must already exist; the bridge does NOT
+# create, rename or delete it.
 LEASE_PLANE_PHASE_B_CHANNEL_ID = int(
     os.environ.get("DISCORD_LEASE_PLANE_PHASE_B_CHANNEL_ID", "0") or "0"
 )

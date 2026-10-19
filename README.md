@@ -123,24 +123,23 @@ channel whose job changes stops advertising the old one. Set
 needs Manage Channels to rewrite a topic; without it the edit is logged and
 skipped.
 
-### Operator-managed and retired channels
+### Operator-managed channels
 
 `DISCORD_LEASE_PLANE_PHASE_B_CHANNEL_ID` (optional) is the id of a channel the
-operator creates and names. It is currently `#lease-plane-phase-b`, renamed
-from `#dialectic`. The bridge mirrors Sentinel's lease-plane Phase B
-transitions there (`lease_plane_phase_b_finding`, and the older
-`lease_plane_phase_b_transition`); they never page `#alerts`. The channel is
-looked up by id, so a rename needs no configuration change. The bridge never
+operator creates and names. When it is set, Sentinel's lease-plane Phase B
+transitions (`lease_plane_phase_b_finding`, and the older
+`lease_plane_phase_b_transition`) arriving over the WebSocket are posted there
+once, instead of to `#residents`/`#signals`; unset, they take that ordinary
+route. They never page `#alerts`. The channel is looked up by id, so the
+operator may rename it without a configuration change; the bridge never
 creates, renames or deletes it, and the startup log prints the name it
-resolved. It currently has no live producer: governance's finding route only
-accepts `*_finding` types, and Sentinel still sends the `_transition` name, so
-the channel stays quiet until Sentinel sends `lease_plane_phase_b_finding` or
-the evaluator is ported to sentinel-beam.
+resolved. The channel may stay quiet: governance's finding route accepts only
+`*_finding` types, so a producer that sends the `_transition` name is rejected
+at ingest.
 
-`#events` is retired. It was the original all-events feed; the bridge has not
-posted to it since 2026-04-17, when events moved to `#activity`, `#signals` and
-`#alerts`, and it is not part of the declared channel structure. The operator
-keeps it archived read-only on the server; the bridge does not manage it.
+Any other channel on the server that is not in the declared structure (for
+example an old all-events feed) is left alone: the bridge neither posts to it
+nor archives, renames or deletes it.
 
 ## Run
 
