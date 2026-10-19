@@ -222,6 +222,9 @@ def test_silent_critical_names_agent_and_duration():
     # The title already says "silent critical"; no Type field repeating it.
     assert _field(embed, "Type") is None
     assert _field(embed, "Severity") == "critical"
+    # Time in the embed timestamp; the footer is the stable type, not ISO text.
+    assert embed.timestamp.isoformat() == "2026-10-19T10:02:00+00:00"
+    assert embed.footer.text == "lifecycle_silent_critical"
 
 
 def test_silent_durations_read_in_hours_and_days():

@@ -39,7 +39,7 @@ from bridge.delivery import DiscordSender
 from bridge.embeds import (
     attention_severity, event_to_embed, finding_destination,
     finding_needs_operator, is_critical_event, is_dismissed_resolution,
-    is_finding_event,
+    is_finding_event, parse_event_timestamp,
 )
 from bridge.mcp_client import GovernanceClient
 
@@ -284,8 +284,10 @@ def broadcaster_event_to_embed(event: dict) -> Optional[discord.Embed]:
             value="Verify expected cadence and last completed work. Silence alone is not proof of a service outage.",
             inline=False,
         )
-    if ts:
-        embed.set_footer(text=str(ts))
+    # Time goes in the embed timestamp (rendered in the reader's zone); the
+    # footer is the stable machine type, not a raw ISO string.
+    embed.timestamp = parse_event_timestamp(ts)
+    embed.set_footer(text=t)
     return embed
 
 

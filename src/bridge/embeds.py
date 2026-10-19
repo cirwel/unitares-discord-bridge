@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from typing import Callable
 
 import discord
@@ -102,20 +103,142 @@ def _evidence_line(ev: dict) -> str:
     return "machine check errored — no evidence either way"
 
 
+def parse_event_timestamp(value: object) -> datetime | None:
+    """An event's ``timestamp`` as an aware datetime, or ``None``.
+
+    Accepts ISO 8601 with an offset or a trailing ``Z``; a naive time is read
+    as UTC (governance writes UTC). Anything unparseable is ``None``, never an
+    exception, so a bad timestamp cannot stop an embed from rendering.
+    """
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        text = value.strip()
+        if text[-1] in "Zz":
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+_SHA256_PREFIX = "sha256:"
+_HEX = re.compile(r"[0-9a-f]+")
+
+
+def short_fingerprint(raw: object) -> str | None:
+    """A finding fingerprint short enough for a phone, or ``None``.
+
+    Up to 24 characters show in full (Watcher and Doctor use 16 hex). A digest
+    shows its first 16 hex characters (``sha256:`` stripped), which is still a
+    unique prefix for Watcher's ``--resolve``. Free text such as Sentinel's
+    ``forced_release:ad_hoc:<uuid>`` shows its last 24 characters, where the
+    distinguishing id is.
+    """
+    fp = str(raw or "").strip()
+    if not fp:
+        return None
+    if len(fp) <= 24:
+        return fp
+    if fp.lower().startswith(_SHA256_PREFIX):
+        return fp[len(_SHA256_PREFIX):][:16]
+    if _HEX.fullmatch(fp.lower()):
+        return fp[:16]
+    return "…" + fp[-24:]
+
+
+# Fields, in order, that say which check/kind/pattern a finding is about. The
+# first one present goes in the title, so its field is not repeated.
+_TITLE_QUALIFIER_KEYS = ("check", "alarm_kind", "finding_type", "pattern")
+
+
+def _title_qualifier(event: dict) -> tuple[str, str] | tuple[None, None]:
+    for key in _TITLE_QUALIFIER_KEYS:
+        value = event.get(key)
+        if value is not None and str(value).strip():
+            return key, str(value).strip()
+    return None, None
+
+
+_HOME_PREFIX = re.compile(r"^/(?:Users|home)/[^/]+/")
+
+
+def short_path(path: str) -> str:
+    """Repo-relative form of an absolute path under ``~/projects``.
+
+    ``/Users/x/projects/unitares/src/a.py`` -> ``unitares/src/a.py`` and
+    ``/Users/x/projects/wt/unitares-fix/src/a.py`` -> ``unitares-fix/src/a.py``,
+    keeping the checkout name. Other home paths become ``~/...``; anything else
+    is unchanged.
+    """
+    for marker in ("/projects/wt/", "/projects/"):
+        idx = path.find(marker)
+        if idx != -1 and path[idx + len(marker):]:
+            return path[idx + len(marker):]
+    return _HOME_PREFIX.sub("~/", path)
+
+
+def _truncate(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
 def event_to_embed(event: dict) -> discord.Embed:
     """Convert a governance event dict to a Discord embed."""
     severity = attention_severity(event, critical=is_critical_event(event))
     event_type = event.get("type", "unknown")
     colour = SEVERITY_COLOURS.get(severity, discord.Colour.greyple())
-    title = EVENT_TITLES.get(event_type, event_type.replace("_", " ").title())
+    base_title = EVENT_TITLES.get(event_type, event_type.replace("_", " ").title())
+    description = _event_description(event)
+    qualifier_key, qualifier = _title_qualifier(event)
+    resolution = is_resolution_finding(event)
+
+    if resolution:
+        title = f"Resolved · {qualifier}" if qualifier else "Resolved"
+        colour = (
+            discord.Colour.light_grey() if is_dismissed_resolution(event)
+            else discord.Colour.green()
+        )
+    else:
+        title = f"{base_title} · {qualifier}" if qualifier else base_title
+
+    # Doctor messages are "<check>: <message>"; the check is now the title.
+    if qualifier_key == "check" and description.startswith(f"{qualifier}: "):
+        description = description[len(qualifier) + 2:]
+
+    file_path = str(event.get("file") or "")
+    if file_path:
+        shortened = short_path(file_path)
+        if shortened != file_path:
+            description = description.replace(file_path, shortened)
 
     embed = discord.Embed(
-        title=title,
-        description=_event_description(event),
+        title=_truncate(title, 256),
+        description=description,
         colour=colour,
+        timestamp=parse_event_timestamp(event.get("timestamp")),
     )
     embed.add_field(name="Agent", value=_event_agent(event), inline=True)
-    embed.add_field(name="Severity", value=severity, inline=True)
+    if resolution:
+        embed.add_field(name="Severity", value=f"resolved (was {severity})", inline=True)
+        action = str(event.get("action") or "").strip()
+        if action:
+            reason = str(event.get("resolution_reason") or "").strip()
+            embed.add_field(
+                name="Action",
+                value=_truncate(f"{action}: {reason}" if reason else action, 1024),
+                inline=True,
+            )
+    else:
+        embed.add_field(name="Severity", value=severity, inline=True)
+
+    fingerprint = short_fingerprint(event.get("fingerprint"))
+    if fingerprint:
+        embed.add_field(name="Fingerprint", value=f"`{fingerprint}`", inline=True)
 
     # Type-specific fields
     if event_type == "verdict_change":
@@ -138,21 +261,32 @@ def event_to_embed(event: dict) -> discord.Embed:
     elif event_type == "sentinel_finding":
         if event.get("violation_class"):
             embed.add_field(name="Violation", value=event["violation_class"], inline=True)
-        if event.get("finding_type"):
+        if event.get("finding_type") and qualifier_key != "finding_type":
             embed.add_field(name="Finding", value=event["finding_type"], inline=True)
     elif event_type == "vigil_finding":
-        if event.get("finding_type"):
+        if event.get("finding_type") and qualifier_key != "finding_type":
             embed.add_field(name="Finding", value=event["finding_type"], inline=True)
-    elif event_type == "watcher_finding":
-        if event.get("pattern"):
-            embed.add_field(name="Pattern", value=event["pattern"], inline=True)
-        if event.get("file"):
-            loc = event["file"]
-            if event.get("line"):
-                loc = f"{loc}:{event['line']}"
-            embed.add_field(name="Location", value=loc, inline=False)
+    elif event_type in ("watcher_finding", "watcher_resolution_finding"):
+        pattern = str(event.get("pattern") or "")
+        # The pattern is in the title, and Watcher's message opens "[P011] ".
+        if (pattern and qualifier_key != "pattern"
+                and not description.startswith(f"[{pattern}]")):
+            embed.add_field(name="Pattern", value=pattern, inline=True)
+        if file_path:
+            loc = short_path(file_path)
+            # Watcher's message already reads "<path>:<line> — <hint>".
+            if loc not in description:
+                if event.get("line"):
+                    loc = f"{loc}:{event['line']}"
+                embed.add_field(name="Location", value=loc, inline=False)
         if event.get("violation_class"):
             embed.add_field(name="Violation", value=event["violation_class"], inline=True)
+        if event_type == "watcher_finding" and fingerprint and not fingerprint.startswith("…"):
+            embed.add_field(
+                name="Close",
+                value=f"`--resolve {fingerprint}` or `--dismiss {fingerprint}`",
+                inline=False,
+            )
 
     # Server-computed event check, attached at ingest for forced-release
     # findings (any event type — governance owns the computation).
@@ -160,7 +294,10 @@ def event_to_embed(event: dict) -> discord.Embed:
     if isinstance(ev, dict) and ev.get("kind") == "forced_release":
         embed.add_field(name="Event check", value=_evidence_line(ev)[:1024], inline=False)
 
-    embed.set_footer(text=f"Event #{event.get('event_id', '?')}")
+    # The time is the embed timestamp (shown in the reader's zone); the footer
+    # is the stable machine name to search for, not the poller's event counter,
+    # which restarts at 1 when governance restarts.
+    embed.set_footer(text=str(event_type))
     return embed
 
 
