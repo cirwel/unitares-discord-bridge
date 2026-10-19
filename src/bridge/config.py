@@ -36,6 +36,25 @@ GOVERNANCE_OPERATOR_TOKEN = os.environ.get("GOVERNANCE_OPERATOR_TOKEN", "")
 # twice per outage) so this cannot become a notification firehose.
 LUMEN_OFFLINE_MENTION = os.environ.get("LUMEN_OFFLINE_MENTION", "").strip()
 
+# File the bridge writes its own log to, through a WatchedFileHandler that
+# reopens the path after newsyslog renames it. Unset (the default) logs to
+# stderr as before. Under launchd, stdout/stderr are file descriptors opened
+# once at spawn: after each rotation they kept writing into the renamed
+# archive, so the live log went blind until the next restart (gaps of ~13.7
+# days, ~13 days and ~29 hours, 2026-10). Point this at the main log path and
+# send the plist's StandardOutPath/StandardErrorPath elsewhere, or every line
+# is written twice.
+#
+# launchd's EnvironmentVariables does not expand "~", and a relative path
+# would resolve against the process's working directory, so the value is
+# expanded and made absolute here.
+def _log_path(raw: str) -> str:
+    raw = raw.strip()
+    return os.path.abspath(os.path.expanduser(raw)) if raw else ""
+
+
+BRIDGE_LOG_PATH = _log_path(os.environ.get("BRIDGE_LOG_PATH", ""))
+
 EVENT_POLL_INTERVAL = int(os.environ.get("EVENT_POLL_INTERVAL", "10"))
 HUD_UPDATE_INTERVAL = int(os.environ.get("HUD_UPDATE_INTERVAL", "30"))
 SENSOR_POLL_INTERVAL = int(os.environ.get("SENSOR_POLL_INTERVAL", "300"))
