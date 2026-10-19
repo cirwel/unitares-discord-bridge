@@ -325,3 +325,15 @@ async def test_restart_mid_outage_does_not_announce_twice():
     await poller._tick()
 
     assert alerts.embeds == []
+
+
+@pytest.mark.asyncio
+async def test_recovery_tolerates_a_naive_or_garbage_outage_start():
+    for since in ("2026-10-19T08:00:00", "not a time", 12345):
+        open_notice = json.dumps({"channel_id": 3, "message_id": 3001, "since": since})
+        poller, _a, _g, _c, _i, _s, alerts = make_poller(
+            _usable_projection(), kv={OUTAGE_CACHE_KEY: open_notice}
+        )
+        await poller._tick()
+        assert len(alerts.embeds) == 1
+        assert "restored" in alerts.embeds[0].title.lower()

@@ -400,6 +400,8 @@ class LumenIterationPoller:
             started = datetime.fromisoformat(since) if since else None
         except (TypeError, ValueError):
             started = None
+        if started is not None and started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
         if started is not None:
             minutes = max(0, int((datetime.now(timezone.utc) - started).total_seconds() // 60))
             description += f" The outage notice was open for about {minutes} min."
