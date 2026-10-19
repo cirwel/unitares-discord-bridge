@@ -98,7 +98,9 @@ class EventPoller:
         self._sender = DiscordSender(
             name="event poller",
             record_receipt=self._record_receipt,
-            maxsize=100,
+            # Same headroom as the WS subscriber: enqueueing never blocks the
+            # poll loop (see _enqueue), so bursts must fit.
+            maxsize=1000,
             priority_channel=lambda: self.alerts_channel,
             delivery_cache=delivery_cache,
         )
@@ -282,7 +284,7 @@ class EventPoller:
                     if self._is_nonresident_subject(event, tags):
                         # Critical (else it was suppressed above): page the
                         # operator once, skip the routine #signals copy.
-                        await self._message_queue.put((self.alerts_channel, embed, event))
+                        await self._enqueue(self.alerts_channel, embed, event)
                         continue
                     target = self._finding_channel(event)
                     if target is None and (
@@ -297,11 +299,11 @@ class EventPoller:
                             self.activity_channel if bucket == "activity"
                             else self.signals_channel
                         )
-                    await self._message_queue.put((target, embed, event))
+                    await self._enqueue(target, embed, event)
                     # A finding already went to its one channel (#alerts when
                     # critical); everything else mirrors critical to #alerts.
                     if not is_finding_event(event) and is_critical_event(event):
-                        await self._message_queue.put((self.alerts_channel, embed, event))
+                        await self._enqueue(self.alerts_channel, embed, event)
                 except Exception as exc:
                     log.error(
                         "Failed to dispatch event %s (type=%s): %s",
@@ -326,14 +328,14 @@ class EventPoller:
                     title="Governance MCP Unreachable",
                     colour=discord.Colour.dark_red(),
                 )
-                await self._message_queue.put((self.alerts_channel, warn, None))
+                await self._enqueue(self.alerts_channel, warn, None)
             elif self.gov.consecutive_failures == 0 and self._gov_alert_sent:
                 self._gov_alert_sent = False
                 recovered = discord.Embed(
                     title="Governance MCP Recovered",
                     colour=discord.Colour.green(),
                 )
-                await self._message_queue.put((self.alerts_channel, recovered, None))
+                await self._enqueue(self.alerts_channel, recovered, None)
         except Exception as exc:
             log.error("Event poll error: %s", exc, exc_info=exc)
 
@@ -391,6 +393,27 @@ class EventPoller:
                 error=error,
             )
         )
+
+    async def _enqueue(self, channel, embed, event: dict | None) -> None:
+        """Queue one post without ever blocking the poll loop.
+
+        A blocking put stalled the loop for as long as Discord was down once
+        the queue filled, so the liveness heartbeat went stale (the watchdog
+        restarts the bridge after 180 s) and the restart lost everything
+        queued. An #alerts post evicts the oldest routine post instead of
+        failing (SendQueue); a routine post that finds the queue full is
+        recorded as lost.
+        """
+        try:
+            self._message_queue.put_nowait((channel, embed, event))
+        except asyncio.QueueFull:
+            log.warning("Send queue full; dropping %s post", getattr(channel, "name", "?"))
+            await self._record_receipt(
+                "bridge.delivery_failed",
+                source_event=event,
+                channel=channel,
+                reason="send_queue_full",
+            )
 
     async def _send_loop(self) -> None:
         """Drain the send queue (see :class:`bridge.delivery.DiscordSender`)."""

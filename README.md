@@ -81,10 +81,15 @@ The event and WebSocket feeds share one send loop design
   `BRIDGE_SEND_PROBE_MAX_SECONDS` (default 60). One success resumes normal
   sending.
 - Messages to `#alerts` jump the queue, so an alert raised during an outage is
-  the first thing delivered on recovery.
+  the first thing delivered on recovery. A message that failed goes back to the
+  front of its lane even if the queue has since filled. An alert put into a
+  full queue evicts the oldest routine post (receipted as `send_queue_full`)
+  instead of being dropped. Enqueueing never blocks the poll loop, so the
+  liveness heartbeat stays fresh through an outage.
 - A message still undeliverable `BRIDGE_SEND_MAX_AGE_SECONDS` (default 900)
-  after it was queued, or one that finds the queue full, is recorded as a
-  `bridge.delivery_failed` receipt with reason `discord_unreachable`.
+  after it was queued is recorded as a `bridge.delivery_failed` receipt with
+  reason `discord_unreachable`; a routine post that finds the queue full is
+  recorded with reason `send_queue_full`.
 - Rate limits and errors Discord actually returned keep their existing
   handling. The loop restarts itself after an unexpected error and logs it at
   error level. Queued messages live in memory, so a restart during an outage

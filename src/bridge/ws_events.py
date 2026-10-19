@@ -536,7 +536,8 @@ class WSEventSubscriber:
                 channel=target,
                 reason="send_queue_full",
             )
-            return
+            # No return: the #alerts mirror below can still evict a routine
+            # post (SendQueue) and must not be lost with the routine copy.
         # Findings were routed to their one channel above (#alerts when they
         # need the operator); only non-findings mirror.
         if not is_finding_event(event) and is_critical_broadcaster_event(event):

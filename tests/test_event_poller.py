@@ -107,11 +107,12 @@ def _make_poller(
 
     routed: list[tuple[str, discord.Embed]] = []
 
-    async def capture_put(item):
+    def capture_put(item):
         channel, embed, _source_event = item
         routed.append((channel.name, embed))
 
-    poller._message_queue.put = capture_put
+    # The poller enqueues with put_nowait (it never blocks the poll loop).
+    poller._message_queue.put_nowait = capture_put
     return poller, routed
 
 

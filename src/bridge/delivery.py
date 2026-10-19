@@ -22,9 +22,12 @@ Two pieces:
     elapses, the next message in line is the probe. One success closes it.
   - #alerts messages jump the queue (:class:`SendQueue`), so a critical item
     enqueued during an outage is the first thing delivered on recovery.
-  - A message still undeliverable after ``SEND_MAX_AGE_SECONDS`` (or when the
-    queue is full) is recorded durably as ``bridge.delivery_failed`` with
-    reason ``discord_unreachable`` and dropped.
+  - A message the sender took and could not deliver goes back to the front of
+    its lane regardless of ``maxsize``; an #alerts message put into a full
+    queue evicts the oldest routine one (whose loss is receipted) rather than
+    failing. A message still undeliverable after ``SEND_MAX_AGE_SECONDS`` is
+    recorded durably as ``bridge.delivery_failed`` with reason
+    ``discord_unreachable`` and dropped.
   - The loop supervises itself: an error escaping per-message handling is
     logged at error level, counted in ``loop_restarts``, and the loop keeps
     running. Rate-limit handling is unchanged from the original loops.
@@ -179,11 +182,67 @@ def _item_channel(item: Any) -> Any:
 class SendQueue(asyncio.Queue):
     """``asyncio.Queue`` with an express lane: items for which ``is_priority``
     is true (messages to #alerts) are always dequeued first, FIFO within each
-    lane. Items are returned exactly as put."""
+    lane. Items are returned exactly as put.
 
-    def __init__(self, maxsize: int = 0, *, is_priority: Callable[[Any], bool] | None = None) -> None:
+    Two rules keep an alert from being the thing that gets dropped:
+
+    * :meth:`requeue` puts a message the sender already took back at the
+      FRONT of its own lane and ignores ``maxsize``. While a send is awaited
+      a blocked producer can refill the freed slot; a failed alert must not
+      then find the queue full.
+    * An urgent item put into a full queue evicts the oldest ROUTINE item
+      instead of failing. ``on_evict(item)`` is called with the evicted item
+      so its loss can be recorded. Only a queue full of urgent items rejects
+      an urgent put.
+    """
+
+    def __init__(
+        self,
+        maxsize: int = 0,
+        *,
+        is_priority: Callable[[Any], bool] | None = None,
+        on_evict: Callable[[Any], None] | None = None,
+    ) -> None:
         self._is_priority = is_priority or (lambda _item: False)
+        self._on_evict = on_evict
         super().__init__(maxsize)
+
+    def _urgent_item(self, item: Any) -> bool:
+        try:
+            return bool(self._is_priority(item))
+        except Exception:  # noqa: BLE001 - a bad item must not break the queue
+            return False
+
+    def _make_room_for(self, item: Any) -> None:
+        """Evict the oldest routine item if ``item`` is urgent and we're full."""
+        if not (self.full() and self._queue and self._urgent_item(item)):
+            return
+        evicted = self._queue.popleft()
+        self.task_done()  # the evicted item will never be processed
+        if self._on_evict is not None:
+            try:
+                self._on_evict(evicted)
+            except Exception:  # noqa: BLE001 - recording a loss must not lose the alert
+                log.exception("send queue eviction hook failed")
+
+    def put_nowait(self, item: Any) -> None:
+        self._make_room_for(item)
+        super().put_nowait(item)
+
+    async def put(self, item: Any) -> None:
+        self._make_room_for(item)
+        if self._urgent_item(item) and not self.full():
+            super().put_nowait(item)
+            return
+        await super().put(item)
+
+    def requeue(self, item: Any) -> None:
+        """Return a taken item to the front of its lane, ignoring ``maxsize``."""
+        (self._urgent if self._urgent_item(item) else self._queue).appendleft(item)
+        # Same bookkeeping as asyncio.Queue.put_nowait (stable across 3.12-3.14).
+        self._unfinished_tasks += 1
+        self._finished.clear()
+        self._wakeup_next(self._getters)
 
     def _init(self, maxsize: int) -> None:  # noqa: D401 - asyncio.Queue hook
         self._queue = collections.deque()
@@ -198,11 +257,7 @@ class SendQueue(asyncio.Queue):
         return self.qsize() == 0
 
     def _put(self, item: Any) -> None:
-        try:
-            urgent = bool(self._is_priority(item))
-        except Exception:  # noqa: BLE001 - a bad item must not break the queue
-            urgent = False
-        (self._urgent if urgent else self._queue).append(item)
+        (self._urgent if self._urgent_item(item) else self._queue).append(item)
 
     def _get(self) -> Any:
         return self._urgent.popleft() if self._urgent else self._queue.popleft()
@@ -229,7 +284,8 @@ class DiscordSender:
         self._priority_channel = priority_channel
         self.delivery_cache = delivery_cache
         self.pacing = pacing
-        self.queue = SendQueue(maxsize, is_priority=self._is_priority)
+        self.queue = SendQueue(maxsize, is_priority=self._is_priority, on_evict=self._evicted)
+        self._eviction_tasks: set[asyncio.Task] = set()
         # Circuit breaker: monotonic time before which nothing is sent.
         self._outage_until = 0.0
         self._probe_delay = 0.0
@@ -246,16 +302,35 @@ class DiscordSender:
     def in_outage(self) -> bool:
         return time.monotonic() < self._outage_until
 
-    async def _requeue(self, item: Outgoing, *, reason_if_full: str) -> None:
-        try:
+    def _requeue(self, item: Outgoing) -> None:
+        """Back to the front of its lane; never dropped for lack of room."""
+        requeue = getattr(self.queue, "requeue", None)
+        if requeue is not None:
+            requeue(item)
+        else:  # a plain asyncio.Queue swapped in by a caller
             self.queue.put_nowait(item)
-        except asyncio.QueueFull:
-            await self._record_receipt(
-                "bridge.delivery_failed",
-                source_event=item.source_event,
-                channel=item.channel,
-                reason=reason_if_full,
+
+    def _evicted(self, raw: Any) -> None:
+        """An alert displaced this routine message from a full queue."""
+        try:
+            item = as_outgoing(raw)
+        except ValueError:
+            return
+        log.warning("%s: send queue full; dropped a routine message for an alert", self.name)
+        try:
+            task = asyncio.get_running_loop().create_task(
+                self._record_receipt(
+                    "bridge.delivery_failed",
+                    source_event=item.source_event,
+                    channel=item.channel,
+                    reason="send_queue_full",
+                    error="evicted for an #alerts message",
+                )
             )
+        except RuntimeError:  # no running loop (sync test context)
+            return
+        self._eviction_tasks.add(task)
+        task.add_done_callback(self._eviction_tasks.discard)
 
     # -- breaker -----------------------------------------------------------
 
@@ -302,7 +377,7 @@ class DiscordSender:
             )
             return
         # Straight back on the queue: no per-message sleep during an outage.
-        await self._requeue(item, reason_if_full="discord_unreachable")
+        self._requeue(item)
 
     async def _process(self, item: Outgoing) -> None:
         item.attempts += 1
@@ -328,7 +403,7 @@ class DiscordSender:
                 reason="discord_rate_limited",
             )
             await asyncio.sleep(exc.retry_after)
-            await self._requeue(item, reason_if_full="send_queue_full")
+            self._requeue(item)
         except discord.HTTPException as exc:
             self._close_breaker()
             if exc.status == 429:
@@ -341,7 +416,7 @@ class DiscordSender:
                     reason="discord_http_429",
                 )
                 await asyncio.sleep(retry)
-                await self._requeue(item, reason_if_full="send_queue_full")
+                self._requeue(item)
             else:
                 log.warning("%s: discord send failed (%s)", self.name, exc)
                 await self._record_receipt(

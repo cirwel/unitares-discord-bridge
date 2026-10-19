@@ -297,16 +297,142 @@ async def test_durable_loss_recorded_once_message_is_too_old(make, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_queue_full_during_outage_is_recorded():
+async def test_failed_alert_is_kept_even_when_the_queue_refilled_meanwhile():
+    # The sender takes the alert, a producer refills the freed slot while the
+    # send is awaited, then the send fails: the alert must not be dropped.
     gov = _gov()
-    sender = _poller(gov)
-    ch = _ch(9)
-    item = delivery.Outgoing(ch, discord.Embed(title="t"), EVENT)
-    for i in range(_queue(sender).maxsize):
-        _queue(sender).put_nowait((ch, discord.Embed(title=str(i)), None))
-    await sender._sender._handle_unreachable(item, dns_error())
-    (receipt,) = _receipts(gov)
-    assert receipt["reason"] == "discord_unreachable"
+    alerts = _ch(8, "alerts")
+    routine = _ch(20, "activity", side_effect=lambda **kw: MagicMock(id=7))
+    sender = delivery.DiscordSender(
+        name="t", record_receipt=_receipt_fn(gov), maxsize=3,
+        priority_channel=lambda: alerts,
+    )
+    sender.pacing = 0
+    q = sender.queue
+    q.put_nowait((alerts, discord.Embed(title="ALERT"), EVENT))
+    q.put_nowait((routine, discord.Embed(title="r1"), None))
+    q.put_nowait((routine, discord.Embed(title="r2"), None))
+    calls = {"n": 0}
+
+    async def alerts_send(*, embed, nonce):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            q.put_nowait((routine, discord.Embed(title="r3"), None))  # back at cap
+            assert q.full()
+            raise dns_error()
+        return MagicMock(id=1000)
+
+    alerts.send = AsyncMock(side_effect=alerts_send)
+    task = asyncio.create_task(sender.run())
+    try:
+        for _ in range(200):
+            if alerts.send.await_count >= 2:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    assert alerts.send.await_count == 2  # retried after recovery, delivered
+    assert not any(r.get("reason") == "discord_unreachable" for r in _receipts(gov))
+    assert any(r["discord_message_id"] == "1000" for r in _receipts(gov) if "discord_message_id" in r)
+
+
+def _receipt_fn(gov):
+    async def record(event_type, *, source_event, channel=None, discord_message_id=None,
+                     reason=None, error=None):
+        payload = {"event_type": event_type, "reason": reason,
+                   "channel_key": getattr(channel, "name", None)}
+        if discord_message_id is not None:
+            payload["discord_message_id"] = str(discord_message_id)
+        await gov.record_bridge_event(payload)
+    return record
+
+
+def test_urgent_put_into_full_queue_evicts_oldest_routine_item():
+    alerts = object()
+    evicted = []
+    q = delivery.SendQueue(2, is_priority=lambda item: item[0] is alerts, on_evict=evicted.append)
+    q.put_nowait(("routine", "r1"))
+    q.put_nowait(("routine", "r2"))
+    q.put_nowait((alerts, "u1"))
+    assert evicted == [("routine", "r1")]
+    assert [q.get_nowait()[1] for _ in range(2)] == ["u1", "r2"]
+
+
+def test_routine_put_into_full_queue_still_fails_and_full_urgent_lane_rejects():
+    alerts = object()
+    q = delivery.SendQueue(1, is_priority=lambda item: item[0] is alerts)
+    q.put_nowait((alerts, "u1"))
+    with pytest.raises(asyncio.QueueFull):
+        q.put_nowait(("routine", "r1"))
+    with pytest.raises(asyncio.QueueFull):
+        q.put_nowait((alerts, "u2"))  # nothing routine to evict
+
+
+@pytest.mark.asyncio
+async def test_blocking_put_of_urgent_item_does_not_wait_when_routine_can_go():
+    alerts = object()
+    q = delivery.SendQueue(1, is_priority=lambda item: item[0] is alerts)
+    q.put_nowait(("routine", "r1"))
+    await asyncio.wait_for(q.put((alerts, "u1")), timeout=0.5)
+    assert q.get_nowait()[1] == "u1"
+
+
+def test_requeue_goes_to_front_of_own_lane_and_ignores_maxsize():
+    alerts = object()
+    q = delivery.SendQueue(2, is_priority=lambda item: item[0] is alerts)
+    q.put_nowait(("routine", "r1"))
+    q.put_nowait(("routine", "r2"))
+    taken = q.get_nowait()
+    q.put_nowait(("routine", "r3"))  # producer refills while the send runs
+    assert q.full()
+    q.requeue(taken)  # no QueueFull
+    assert [q.get_nowait()[1] for _ in range(3)] == ["r1", "r2", "r3"]
+
+
+@pytest.mark.asyncio
+async def test_requeue_wakes_a_waiting_getter():
+    q = delivery.SendQueue(1)
+    getter = asyncio.create_task(q.get())
+    await asyncio.sleep(0)
+    q.requeue(("routine", "r1"))
+    assert (await asyncio.wait_for(getter, timeout=0.5))[1] == "r1"
+
+
+@pytest.mark.asyncio
+async def test_poller_evicts_routine_for_alert_and_never_blocks_the_poll_loop():
+    gov = _gov()
+    alerts = _ch(8, "alerts")
+    poller = _poller(gov, alerts)
+    routine = _ch(20, "activity")
+    q = poller._message_queue
+    for i in range(q.maxsize):
+        q.put_nowait((routine, discord.Embed(title=str(i)), {"type": "agent_idle", "event_id": i}))
+    # Routine post into the full queue: recorded, not blocking.
+    await asyncio.wait_for(poller._enqueue(routine, discord.Embed(title="late"), EVENT), timeout=0.5)
+    # Alert into the full queue: evicts the oldest routine post.
+    await asyncio.wait_for(poller._enqueue(alerts, discord.Embed(title="A"), EVENT), timeout=0.5)
+    await asyncio.gather(*list(poller._sender._eviction_tasks))
+    assert q.get_nowait()[0] is alerts
+    reasons = [(r["reason"], r.get("source_event_id")) for r in _receipts(gov)]
+    assert ("send_queue_full", 1) in reasons  # the late routine post
+    assert ("send_queue_full", 0) in reasons  # the evicted oldest routine post
+
+
+@pytest.mark.asyncio
+async def test_ws_alert_into_full_queue_evicts_routine():
+    gov = _gov()
+    alerts = _ch(8, "alerts")
+    sub = _subscriber(gov, alerts)
+    q = sub._send_queue
+    routine = _ch(20, "activity")
+    for i in range(q.maxsize):
+        q.put_nowait((routine, discord.Embed(title=str(i)), None))
+    await sub._dispatch({"type": "lifecycle_paused", "agent_id": "a", "reason": "x"})
+    hit = [q.get_nowait()[0].name for _ in range(q.qsize())]
+    assert hit[0] == "alerts"
+    assert "signals" not in hit  # the routine copy found the queue full
 
 
 @pytest.mark.asyncio

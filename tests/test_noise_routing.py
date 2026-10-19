@@ -52,10 +52,10 @@ def _poller(events, *, tags=None, embodied=True, residents=True):
     )
     routed: list[str] = []
 
-    async def capture(item):
+    def capture(item):
         routed.append(item[0].name)
 
-    poller._message_queue.put = capture
+    poller._message_queue.put_nowait = capture
     return poller, routed
 
 
