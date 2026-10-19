@@ -188,3 +188,29 @@ async def test_anima_streaks_are_per_method(caplog):
             await client.fetch_state()
     assert len(_levels(caplog, logging.WARNING)) == 2
     assert client.is_online is False
+
+
+# --- review follow-ups ---
+
+def test_cause_uses_the_message_and_reprs_only_an_empty_one():
+    assert mcp_client._cause(httpx.ConnectError("refused")) == "ConnectError: refused"
+    assert mcp_client._cause(httpx.ReadTimeout("")) == "ReadTimeout: ReadTimeout('')"
+
+
+@pytest.mark.asyncio
+async def test_drawing_failure_warning_names_the_file(caplog):
+    with mock_httpx_client_error("get", httpx.ReadTimeout("")):
+        client = AnimaClient("http://anima")
+        with caplog.at_level(logging.WARNING, logger="bridge.mcp_client"):
+            assert await client.fetch_drawing_image("art_042.png") is None
+    warnings = _levels(caplog, logging.WARNING)
+    assert len(warnings) == 1
+    assert "art_042.png" in warnings[0].getMessage()
+
+
+def test_log_path_expands_home_and_is_absolute(monkeypatch):
+    from bridge import config
+    monkeypatch.setenv("HOME", "/Users/someone")
+    assert config._log_path("~/Library/Logs/bridge.log") == "/Users/someone/Library/Logs/bridge.log"
+    assert os.path.isabs(config._log_path("logs/bridge.log"))
+    assert config._log_path("  ") == ""

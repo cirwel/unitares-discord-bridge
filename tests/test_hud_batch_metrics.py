@@ -30,13 +30,24 @@ def _list_row(agent_id, label, *, updates=10, metrics=None, last="2026-10-19T11:
     }
 
 
-def _row_metrics(E=0.7, I=0.8, S=0.2, V=-0.05, risk=0.3, basin="boundary", verdict="safe"):
-    # Shape of query.py _monitor_metrics / _persisted_state_metrics.
+def _row_metrics(
+    E=0.7, I=0.8, S=0.2, V=-0.05, risk=0.3, basin="boundary", verdict="safe",
+    source="persisted_state",
+):
+    # Shape of query.py _persisted_state_metrics (source="persisted_state") or
+    # _monitor_metrics (source="live_monitor" / "restored_monitor").
     return {
         "E": E, "I": I, "S": S, "V": V, "coherence": 0.5,
         "risk_score": risk, "basin": basin, "verdict": verdict,
-        "source": "live_monitor",
+        "source": source,
     }
+
+
+_PER_AGENT_PAYLOAD = {"result": {
+    "success": True, "E": {"value": 0.5}, "I": {"value": 0.6},
+    "S": {"value": 0.1}, "V": {"value": 0.0}, "basin": {"value": "high"},
+    "risk_score": {"value": 0.1, "status": "🟢 low"},
+}}
 
 
 def _gov_listing(rows, *, grouped=False):
@@ -138,15 +149,59 @@ async def test_row_without_metrics_falls_back_to_one_call():
     ]
     gov = _gov_listing(rows)
     agents = await fetch_agents(gov, with_metrics=True)
-    gov.call_tool = AsyncMock(return_value={"result": {
-        "success": True, "E": {"value": 0.5}, "I": {"value": 0.6},
-        "S": {"value": 0.1}, "V": {"value": 0.0}, "basin": {"value": "high"},
-        "risk_score": {"value": 0.1, "status": "🟢 low"},
-    }})
+    gov.call_tool = AsyncMock(return_value=_PER_AGENT_PAYLOAD)
     metrics = await fetch_metrics(gov, agents)
     assert gov.call_tool.await_count == 1
     assert gov.call_tool.await_args.args == ("get_governance_metrics", {"agent_id": "uuid-b"})
     assert set(metrics) == {"uuid-a", "uuid-b"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["live_monitor", "restored_monitor", None])
+async def test_loaded_monitor_row_reads_primary_eisv_per_agent(source):
+    """A loaded monitor's list row carries monitor.state (the ODE vector);
+    get_governance_metrics reports the primary EISV (behavioral when
+    confident). The HUD must show the latter for every agent, so these rows
+    are not trusted and get one call each."""
+    rows = [
+        _list_row("uuid-a", "alpha", metrics=_row_metrics()),
+        _list_row("uuid-r", "resident", metrics=_row_metrics(E=0.95, source=source)),
+    ]
+    gov = _gov_listing(rows)
+    agents = await fetch_agents(gov, with_metrics=True)
+    gov.call_tool = AsyncMock(return_value=_PER_AGENT_PAYLOAD)
+    metrics = await fetch_metrics(gov, agents)
+    assert gov.call_tool.await_count == 1
+    assert gov.call_tool.await_args.args == ("get_governance_metrics", {"agent_id": "uuid-r"})
+    assert metrics["uuid-r"]["E"] == 0.5  # the per-agent value, not the row's 0.95
+    assert metrics["uuid-a"]["E"] == 0.7
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["live_monitor", "persisted_state"])
+async def test_never_observed_row_with_seed_metrics_is_no_state(source):
+    """get_or_create_monitor gives a 0-update agent the genesis seed vector;
+    the row then has all four values but is not a reading."""
+    seed = _row_metrics(E=0.7, I=0.8, S=0.2, V=0.0, source=source)
+    gov = _gov_listing([_list_row("uuid-seed", "seed", updates=0, metrics=seed)])
+    agents = await fetch_agents(gov, with_metrics=True)
+    gov.call_tool.reset_mock()
+    metrics = await fetch_metrics(gov, agents)
+    gov.call_tool.assert_not_awaited()
+    assert metrics == {}
+
+
+@pytest.mark.asyncio
+async def test_unlabeled_uuid_row_gets_a_short_label():
+    uuid = "094e2c8a-d22a-4b52-a953-a54bbea69aa4"
+    gov = _gov_listing([
+        _list_row(uuid, None, metrics=_row_metrics()),
+        _list_row("Claude_Code_20261019_abcd1234", None, metrics=_row_metrics()),
+    ])
+    agents = await fetch_agents(gov, with_metrics=True)
+    labels = {a["id"]: a["label"] for a in agents}
+    assert labels[uuid] == "094e2c8a"
+    assert labels["Claude_Code_20261019_abcd1234"] == "Claude_Code_20261019_abcd1234"
 
 
 @pytest.mark.asyncio
@@ -206,7 +261,15 @@ def test_bool_risk_score_is_not_a_number():
     assert _derive_verdict({"risk_score": True}) == "guide"
 
 
-# --- parity with get_governance_metrics for the same state ---
+# --- parsing equivalence of the two payload shapes ---
+#
+# These tests feed the SAME hand-built numbers into a list row and a
+# get_governance_metrics payload and check the bridge turns both into the
+# same HUD entry. They prove only that the bridge parses both shapes alike.
+# They cannot detect governance returning different values in the two calls
+# (that is what the source gate in fetch_metrics and
+# test_loaded_monitor_row_reads_primary_eisv_per_agent are for); a true
+# value-parity check needs a governance-side contract test.
 
 def _lite_metrics_payload(E, I, S, V, risk, basin, verdict):
     """Shape of runtime_queries.get_governance_metrics_data(lite=True)."""
@@ -233,7 +296,7 @@ def _lite_metrics_payload(E, I, S, V, risk, basin, verdict):
     (0.80, "boundary", "high-risk"),
     (0.30, "low", "safe"),
 ])
-async def test_list_row_matches_per_agent_read(risk, basin, verdict):
+async def test_list_row_parses_like_per_agent_read(risk, basin, verdict):
     E, I, S, V = 0.71, 0.82, 0.19, -0.04
     gov = _gov_listing([_list_row(
         "uuid-a", "alpha",

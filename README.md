@@ -61,9 +61,13 @@ separately.
 
 The live HUD and `/status` read the fleet in one call:
 `agent(action="list", include_metrics=true)` returns each agent's EISV with
-its row. Only an observed agent whose row came back without a reading gets a
-per-agent `get_governance_metrics` call; an agent with no state row shows as
-"no state".
+its row. A row governance projected from the persisted state row
+(`source: persisted_state`) is used as-is. A row built from a monitor loaded
+in the governance process (`live_monitor`, `restored_monitor`) reports the
+monitor's ODE state rather than the primary EISV `get_governance_metrics`
+returns, so those agents, and any observed agent whose row has no full
+reading, still get one per-agent `get_governance_metrics` call. An agent with
+no state row shows as "no state".
 
 `GOVERNANCE_OPERATOR_TOKEN` is separate from `GOVERNANCE_API_TOKEN` and is sent
 as the `X-Unitares-Operator` header. Governance redacts other agents' UUIDs
@@ -138,6 +142,11 @@ the stdout/stderr launchd opened at spawn keeps writing into the renamed
 archive until it restarts. When `BRIDGE_LOG_PATH` is the file launchd's
 `StandardOutPath`/`StandardErrorPath` already point at, move those to a
 separate file, or every line is written twice.
+
+Merging this alone does not stop the rotation gaps: the deployed launchd plist
+has to set `BRIDGE_LOG_PATH` to an absolute path (and move its
+`StandardOutPath`/`StandardErrorPath`) before the bridge stops writing into
+the rotated archive.
 
 httpx request lines are logged at WARNING and above only. A failing
 governance or Lumen read logs WARNING on the first failure of a streak and on

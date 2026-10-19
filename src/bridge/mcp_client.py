@@ -36,9 +36,11 @@ def _cause(exc: BaseException) -> str:
     """Typed, never-empty description of an exception.
 
     ``str()`` of an httpx timeout is "", which left 299 of 311 failure
-    warnings with an empty cause.
+    warnings with an empty cause. The repr is used only when the message is
+    empty, so a normal failure reads "ConnectError: refused" rather than
+    "ConnectError: ConnectError('refused')".
     """
-    return f"{type(exc).__name__}: {exc!r}"
+    return f"{type(exc).__name__}: {str(exc) or repr(exc)}"
 
 
 def _failure_level(streak: int) -> int:
@@ -54,12 +56,16 @@ class _FailureStreaks:
         self.service = service
         self._streaks: dict[str, int] = {}
 
-    def failed(self, key: str, exc: BaseException) -> None:
+    def failed(self, key: str, exc: BaseException, detail: str = "") -> None:
+        """``detail`` names what this attempt was for (e.g. a filename), so
+        the WARNING says which item failed even though the streak is keyed
+        by operation."""
         streak = self._streaks.get(key, 0) + 1
         self._streaks[key] = streak
+        what = f"{key}({detail})" if detail else key
         log.log(
             _failure_level(streak), "%s %s failed (%d in a row): %s",
-            self.service, key, streak, _cause(exc),
+            self.service, what, streak, _cause(exc),
         )
 
     def succeeded(self, key: str) -> None:
@@ -427,10 +433,12 @@ async def fetch_agents(
     ``with_metrics=True`` asks the full list for each row's metrics in the
     same call, and each returned dict also carries ``"metrics"`` (the row's
     metrics, possibly None) and ``"observed"`` (it has at least one state
-    row). ``fetch_metrics`` reads those instead of calling
-    get_governance_metrics once per agent: the HUD used to make 51 calls
-    every 30 s (about 140k a day), nearly all of the bridge's governance
-    load. Callers that only need labels keep the cheaper lite listing.
+    row). ``fetch_metrics`` reads the persisted-state rows among those
+    instead of calling get_governance_metrics once per agent: the HUD used
+    to make 51 calls every 30 s (about 140k a day), nearly all of the
+    bridge's governance load. Agents with a loaded monitor still get their
+    own call (see ``fetch_metrics``). Callers that only need labels keep the
+    cheaper lite listing.
     """
     if with_metrics:
         arguments = {
@@ -481,7 +489,11 @@ async def fetch_agents(
                 # Skip rows without a usable id — passing "" downstream
                 # silently fires get_governance_metrics(agent_id="").
                 continue
-            label = item.get("label") or item.get("name") or agent_id
+            # The lite listing falls back to the public handle for an
+            # unlabeled agent; the full row has no handle, so with the
+            # operator token an unlabeled agent's id is its full UUID.
+            # Shorten that rather than print 36 characters on the HUD.
+            label = item.get("label") or item.get("name") or _short_id(agent_id)
             agent = {"id": agent_id, "label": label}
             if with_metrics:
                 agent["metrics"] = item.get("metrics")
@@ -489,8 +501,9 @@ async def fetch_agents(
             agents.append(agent)
         if redacted:
             log.warning(
-                "agent(action='list') redacted %d/%d agent UUIDs — HUD cannot read EISV "
-                "for these. Set GOVERNANCE_OPERATOR_TOKEN (sent as "
+                "agent(action='list') redacted %d/%d agent UUIDs — the per-agent "
+                "get_governance_metrics read and /agent lookups cannot resolve "
+                "these handles. Set GOVERNANCE_OPERATOR_TOKEN (sent as "
                 "X-Unitares-Operator) to receive real UUIDs.",
                 redacted, len(items),
             )
@@ -505,11 +518,19 @@ async def fetch_metrics(
 ) -> dict[str, dict]:
     """Fetch EISV metrics for each agent. Returns {agent_id: {E, I, S, V, verdict}}.
 
-    Agents from ``fetch_agents(..., with_metrics=True)`` already carry their
-    metrics row; those are read without a call. Only an observed agent whose
-    row came back without a usable reading falls back to one
-    get_governance_metrics call. An agent with no state row has nothing to
-    read and renders as "no state".
+    Agents from ``fetch_agents(..., with_metrics=True)`` carry their list
+    row's metrics. An agent with no state row (``observed`` False) has
+    nothing to read and renders as "no state", whatever the row holds: a
+    loaded 0-update monitor reports its genesis seed vector, not a reading.
+
+    A row is read without a call only when governance projected it from the
+    persisted state row (``source == "persisted_state"``). That row stores the
+    primary EISV get_governance_metrics reports (behavioral when its
+    confidence is >= 0.3, else ODE). A row built from a loaded monitor
+    (``live_monitor`` / ``restored_monitor``) carries the monitor's raw ODE
+    state instead, so those agents, and any row without a full reading, get
+    one get_governance_metrics call. Otherwise one HUD would mix two EISV
+    sources.
     """
     metrics: dict[str, dict] = {}
     for agent in agents:
@@ -520,11 +541,11 @@ async def fetch_metrics(
             # "" — they return empty dicts and pollute the HUD.
             continue
         if "metrics" in agent:
-            row = agent.get("metrics")
-            if _has_eisv(row):
-                metrics[agent_id] = _metrics_entry(row)
-                continue
             if not agent.get("observed", True):
+                continue
+            row = agent.get("metrics")
+            if _has_eisv(row) and row.get("source") == _ROW_SOURCE_PERSISTED:
+                metrics[agent_id] = _metrics_entry(row)
                 continue
         if _is_reserved_agent_id(agent_id):
             # Reserved-prefix ids (e.g. a redacted "mcp_<date>_<suffix>" human
@@ -590,6 +611,19 @@ def _attention_failure_reason(data: object) -> str | None:
             f"authority_granted={result.get('authority_granted')!r})"
         )
     return None
+
+
+# query.py _persisted_state_metrics tags its projection with this source.
+# The other sources (live_monitor, restored_monitor) read monitor.state, the
+# ODE vector, not the primary EISV get_governance_metrics returns.
+_ROW_SOURCE_PERSISTED = "persisted_state"
+
+
+def _short_id(agent_id: str) -> str:
+    """First 8 characters of a full UUID; any other id is returned as-is."""
+    if len(agent_id) == 36 and agent_id.count("-") == 4:
+        return agent_id[:8]
+    return agent_id
 
 
 def _has_eisv(row) -> bool:
@@ -690,8 +724,7 @@ class AnimaClient:
             self._failures.succeeded("fetch_drawing_image")
             return resp.content
         except Exception as exc:
-            self._failures.failed("fetch_drawing_image", exc)
-            log.debug("anima fetch_drawing_image failed for %s", filename)
+            self._failures.failed("fetch_drawing_image", exc, detail=filename)
             return None
         finally:
             if self._client is None:
