@@ -21,7 +21,7 @@ from bridge.embeds import (
     is_dismissed_resolution,
     is_finding_event,
 )
-from bridge.delivery import is_transient_send_error, send_with_retry
+from bridge.delivery import DiscordSender
 from bridge.mcp_client import GovernanceClient, fetch_agents
 from bridge.tasks import cancel_tasks, create_logged_task
 
@@ -92,10 +92,25 @@ class EventPoller:
         self._task: asyncio.Task | None = None
         self._send_task: asyncio.Task | None = None
         self._gov_alert_sent: bool = False
-        # Items are (channel, embed, source_event) or, once re-queued after
-        # Discord was unreachable, (channel, embed, source_event, redeliveries).
-        self._message_queue: asyncio.Queue[tuple] = asyncio.Queue(maxsize=100)
-        self._redelivery_tasks: set[asyncio.Task] = set()
+        # Shared queue + supervised send loop (bridge/delivery.py): stable
+        # nonces, outage circuit breaker, #alerts express lane. Items put on
+        # the queue are (channel, embed, source_event) tuples.
+        self._sender = DiscordSender(
+            name="event poller",
+            record_receipt=self._record_receipt,
+            maxsize=100,
+            priority_channel=lambda: self.alerts_channel,
+            delivery_cache=delivery_cache,
+        )
+
+    @property
+    def _message_queue(self) -> asyncio.Queue:
+        """The sender's queue (kept as an attribute name for callers/tests)."""
+        return self._sender.queue
+
+    @_message_queue.setter
+    def _message_queue(self, queue: asyncio.Queue) -> None:
+        self._sender.queue = queue
 
     def _finding_channel(self, event: dict) -> discord.TextChannel | None:
         """The one channel a finding is posted to, or ``None`` if it isn't one.
@@ -154,7 +169,7 @@ class EventPoller:
 
     async def stop(self) -> None:
         """Cancel both background tasks."""
-        await cancel_tasks(self._task, self._send_task, *self._redelivery_tasks)
+        await cancel_tasks(self._task, self._send_task)
 
     async def _poll_loop(self) -> None:
         while True:
@@ -377,131 +392,6 @@ class EventPoller:
             )
         )
 
-    async def _deliver(self, channel, embed, source_event) -> tuple[int | None, bool]:
-        """One logical send, retrying transient connection errors."""
-        async def attempt() -> tuple[int | None, bool]:
-            if self.delivery_cache is not None:
-                return await self.delivery_cache.send(channel, embed, source_event)
-            message = await channel.send(embed=embed)
-            return getattr(message, "id", None), False
-
-        return await send_with_retry(attempt, what="event poller send")
-
-    async def _redeliver_later(self, item: tuple, delay: float) -> None:
-        await asyncio.sleep(delay)
-        try:
-            self._message_queue.put_nowait(item)
-        except asyncio.QueueFull:
-            channel, _embed, source_event, *_ = item
-            await self._record_receipt(
-                "bridge.delivery_failed",
-                source_event=source_event,
-                channel=channel,
-                reason="discord_unreachable",
-                error="send queue full at redelivery",
-            )
-
-    async def _handle_unreachable(self, item: tuple, exc: BaseException) -> None:
-        """Re-queue a message Discord could not be reached for, a bounded number
-        of times; record the loss durably once redelivery is exhausted."""
-        channel, embed, source_event, *rest = item
-        redeliveries = rest[0] if rest else 0
-        if redeliveries < config.SEND_REDELIVERIES:
-            log.warning(
-                "Discord unreachable (%s); redelivery %d/%d in %.0fs",
-                exc, redeliveries + 1, config.SEND_REDELIVERIES,
-                config.SEND_REDELIVERY_DELAY_SECONDS,
-            )
-            task = create_logged_task(
-                self._redeliver_later(
-                    (channel, embed, source_event, redeliveries + 1),
-                    config.SEND_REDELIVERY_DELAY_SECONDS,
-                ),
-                name="event-redeliver",
-            )
-            self._redelivery_tasks.add(task)
-            task.add_done_callback(self._redelivery_tasks.discard)
-            return
-        log.error("Discord unreachable (%s); giving up on message", exc)
-        await self._record_receipt(
-            "bridge.delivery_failed",
-            source_event=source_event,
-            channel=channel,
-            reason="discord_unreachable",
-            error=str(exc),
-        )
-
     async def _send_loop(self) -> None:
-        while True:
-            item = await self._message_queue.get()
-            channel, embed, source_event, *_ = item
-            try:
-                message_id, duplicate = await self._deliver(channel, embed, source_event)
-                await self._record_receipt(
-                    "bridge.suppressed" if duplicate else "bridge.delivery",
-                    source_event=source_event,
-                    channel=channel,
-                    discord_message_id=message_id,
-                    reason="duplicate_finding_delivery" if duplicate else None,
-                )
-            except discord.RateLimited as exc:
-                # Raised when max_ratelimit_timeout is set and the retry-after exceeds it.
-                # Respect Discord's back-off and re-queue rather than dropping the message.
-                log.warning("Global rate limit hit; retrying in %.1fs", exc.retry_after)
-                await self._record_receipt(
-                    "bridge.rate_limited",
-                    source_event=source_event,
-                    channel=channel,
-                    reason="discord_rate_limited",
-                )
-                await asyncio.sleep(exc.retry_after)
-                await self._message_queue.put((channel, embed, source_event))
-            except discord.HTTPException as exc:
-                if exc.status == 429:
-                    # Per-route 429 that discord.py's internal limiter did not absorb.
-                    # Parse Retry-After from the response headers, fall back to 5 s.
-                    retry_after = float(exc.response.headers.get("Retry-After", 5))
-                    log.warning("Rate limited (HTTP 429); retrying in %.1fs", retry_after)
-                    await self._record_receipt(
-                        "bridge.rate_limited",
-                        source_event=source_event,
-                        channel=channel,
-                        reason="discord_http_429",
-                    )
-                    await asyncio.sleep(retry_after)
-                    await self._message_queue.put((channel, embed, source_event))
-                else:
-                    log.warning("Discord send failed: %s", exc)
-                    await self._record_receipt(
-                        "bridge.delivery_failed",
-                        source_event=source_event,
-                        channel=channel,
-                        reason="discord_http_exception",
-                        error=str(exc),
-                    )
-            except Exception as exc:
-                if is_transient_send_error(exc):
-                    # Retries inside _deliver are spent; re-queue (bounded)
-                    # instead of dropping the message on a DNS blip.
-                    await self._handle_unreachable(item, exc)
-                    await asyncio.sleep(0.15)
-                    continue
-                # Anything not covered above (malformed embed state, etc.)
-                # must not kill the send loop: the poll loop keeps
-                # running and the heartbeat stays fresh, so a dead sender is a
-                # silent Discord outage the watchdog can't see. Log, record,
-                # drop this message, keep draining the queue.
-                log.error(
-                    "Unexpected send error (%s); dropping message",
-                    exc, exc_info=exc,
-                )
-                await self._record_receipt(
-                    "bridge.delivery_failed",
-                    source_event=source_event,
-                    channel=channel,
-                    reason="send_loop_unexpected_error",
-                    error=str(exc),
-                )
-            # 150 ms pacing between sends to stay well under Discord's per-route burst
-            # limit — this is not a retry delay; rate limit retries are handled above.
-            await asyncio.sleep(0.15)
+        """Drain the send queue (see :class:`bridge.delivery.DiscordSender`)."""
+        await self._sender.run()

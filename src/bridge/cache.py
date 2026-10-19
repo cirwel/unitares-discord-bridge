@@ -56,7 +56,7 @@ class FindingDeliveryCache:
         except Exception as exc:  # noqa: BLE001 - persistence is best-effort
             log.debug("finding delivery record failed: %s", exc)
 
-    async def send(self, channel, embed, event: dict | None) -> tuple[int | None, bool]:
+    async def send(self, channel, embed, event: dict | None, **send_kwargs) -> tuple[int | None, bool]:
         event = event or {}
         channel_id = getattr(channel, "id", None)
         eligible = (
@@ -66,7 +66,7 @@ class FindingDeliveryCache:
             and isinstance(channel_id, int)
         )
         if not eligible:
-            message = await channel.send(embed=embed)
+            message = await channel.send(embed=embed, **send_kwargs)
             return getattr(message, "id", None), False
         identity = [channel_id] + [event.get(k) for k in (
             "type", "event_id", "timestamp", "agent_id", "severity",
@@ -87,7 +87,7 @@ class FindingDeliveryCache:
             if stored is not None:
                 self._sent[key] = stored
                 return stored, True
-            message = await channel.send(embed=embed)
+            message = await channel.send(embed=embed, **send_kwargs)
             message_id = getattr(message, "id", None)
             if isinstance(message_id, int):
                 await self._remember(key, message_id)

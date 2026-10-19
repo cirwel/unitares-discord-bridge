@@ -68,16 +68,32 @@ the HUD lists agents but reports "no state" for every one of them.
 
 ### Delivery retries
 
-A send that fails because Discord could not be reached at all (DNS blip,
-refused or timed-out connection) is retried `BRIDGE_SEND_ATTEMPTS` times
-(default 3) with exponential backoff from `BRIDGE_SEND_RETRY_BACKOFF_SECONDS`
-(default 1). If it still fails, the event and WebSocket feeds re-queue it up to
-`BRIDGE_SEND_REDELIVERIES` times (default 5), `BRIDGE_SEND_REDELIVERY_DELAY_SECONDS`
-apart (default 60), which rides out a few minutes of outage. Only then is the
-loss recorded as a `bridge.delivery_failed` receipt with reason
-`discord_unreachable`. Rate limits and errors Discord actually returned keep
-their existing handling. Re-queued messages live in memory, so a restart during
-an outage still loses them.
+The event and WebSocket feeds share one send loop design
+(`src/bridge/delivery.py`):
+
+- Every queued message carries a stable nonce, which Discord enforces. A retry
+  after a reset or timeout returns the message that already landed instead of
+  posting a duplicate.
+- The first connection failure (DNS blip, refused, reset or timed-out
+  connection) opens a circuit breaker. Sends pause and the failed message goes
+  back on the queue. The next send probes after
+  `BRIDGE_SEND_RETRY_BACKOFF_SECONDS` (default 1), doubling up to
+  `BRIDGE_SEND_PROBE_MAX_SECONDS` (default 60). One success resumes normal
+  sending.
+- Messages to `#alerts` jump the queue, so an alert raised during an outage is
+  the first thing delivered on recovery.
+- A message still undeliverable `BRIDGE_SEND_MAX_AGE_SECONDS` (default 900)
+  after it was queued, or one that finds the queue full, is recorded as a
+  `bridge.delivery_failed` receipt with reason `discord_unreachable`.
+- Rate limits and errors Discord actually returned keep their existing
+  handling. The loop restarts itself after an unexpected error and logs it at
+  error level. Queued messages live in memory, so a restart during an outage
+  still loses them.
+
+Direct sends outside the queue (Lumen offline/online notices, self-iteration
+posts) retry only a connection that was never established, up to
+`BRIDGE_SEND_ATTEMPTS` times (default 3). They carry no nonce, so a reset
+after the request went out is not retried.
 
 ### Resident channels
 
