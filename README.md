@@ -59,12 +59,22 @@ shown as caller claims, request provenance is not presented as claim truth, and
 independent verification status and effective policy weight are displayed
 separately.
 
+The live HUD and `/status` read the fleet in one call:
+`agent(action="list", include_metrics=true)` returns each agent's EISV with
+its row. A row governance projected from the persisted state row
+(`source: persisted_state`) is used as-is. A row built from a monitor loaded
+in the governance process (`live_monitor`, `restored_monitor`) reports the
+monitor's ODE state rather than the primary EISV `get_governance_metrics`
+returns, so those agents, and any observed agent whose row has no full
+reading, still get one per-agent `get_governance_metrics` call. An agent with
+no state row shows as "no state".
+
 `GOVERNANCE_OPERATOR_TOKEN` is separate from `GOVERNANCE_API_TOKEN` and is sent
-as the `X-Unitares-Operator` header. It is what the **live HUD needs to show
-EISV at all**: governance redacts other agents' UUIDs from `list_agents` for
-non-operator callers and substitutes a display handle, and a display handle is
-not a valid `agent_id` for `get_governance_metrics`. Without the operator token
-the HUD lists agents but reports "no state" for every one of them.
+as the `X-Unitares-Operator` header. Governance redacts other agents' UUIDs
+from `list_agents` for non-operator callers and substitutes a display handle,
+and a display handle is not a valid `agent_id` for `get_governance_metrics`.
+Without the operator token the per-agent fallback cannot read anything and
+the bridge logs how many rows were redacted.
 
 ### Delivery retries
 
@@ -140,6 +150,26 @@ at ingest.
 Any other channel on the server that is not in the declared structure (for
 example an old all-events feed) is left alone: the bridge neither posts to it
 nor archives, renames or deletes it.
+
+### Logging
+
+The bridge logs to stderr unless `BRIDGE_LOG_PATH` names a file. With it set,
+the bridge writes that file itself through a `WatchedFileHandler`, which
+reopens the path after log rotation renames it. A process that only writes to
+the stdout/stderr launchd opened at spawn keeps writing into the renamed
+archive until it restarts. When `BRIDGE_LOG_PATH` is the file launchd's
+`StandardOutPath`/`StandardErrorPath` already point at, move those to a
+separate file, or every line is written twice.
+
+Merging this alone does not stop the rotation gaps: the deployed launchd plist
+has to set `BRIDGE_LOG_PATH` to an absolute path (and move its
+`StandardOutPath`/`StandardErrorPath`) before the bridge stops writing into
+the rotated archive.
+
+httpx request lines are logged at WARNING and above only. A failing
+governance or Lumen read logs WARNING on the first failure of a streak and on
+every 20th after it, with the exception type, then one INFO line when the
+streak ends.
 
 ## Run
 

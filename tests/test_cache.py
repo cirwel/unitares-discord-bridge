@@ -51,6 +51,16 @@ async def test_hud_message(cache):
         assert message_id == 222
 
 
+@pytest.mark.asyncio
+async def test_sensor_message_round_trips_and_tolerates_corruption(cache):
+    async with cache:
+        assert await cache.get_sensor_message() is None
+        await cache.set_sensor_message(333, 444)
+        assert await cache.get_sensor_message() == (333, 444)
+        await cache.set_kv("sensor_message", "not json")
+        assert await cache.get_sensor_message() is None
+
+
 def finding(**changes):
     return {"type": "sentinel_alarm_finding", "event_id": 6,
             "timestamp": "2026-10-14T08:32:47Z", "agent_id": "resident",

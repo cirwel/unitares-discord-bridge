@@ -1,5 +1,5 @@
 import json
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import discord
 import pytest
@@ -36,6 +36,31 @@ def test_status_embed_with_agents():
 def test_status_embed_empty():
     embed = build_status_embed([], {})
     assert "No active agents" in embed.description
+
+
+def test_status_embed_is_a_dated_snapshot_not_live():
+    """A /status reply is never edited again, so "Live" was misleading."""
+    embed = build_status_embed([{"id": "a1", "label": "opus"}], {})
+    assert "live" not in embed.title.lower()
+    assert "snapshot" in embed.title.lower()
+    assert embed.timestamp is not None
+    assert embed.timestamp.tzinfo is not None
+
+
+def test_commands_topic_lists_every_registered_slash_command():
+    from discord.ext import commands as ext_commands
+
+    from bridge.commands import setup_commands
+    from bridge.server_setup import CHANNEL_STRUCTURE
+
+    bot = ext_commands.Bot(command_prefix="!", intents=discord.Intents.none())
+    setup_commands(bot, MagicMock(), MagicMock())
+    topic = CHANNEL_STRUCTURE["CONTROL"]["commands"]["topic"]
+    names = [command.name for command in bot.tree.get_commands()]
+    assert names
+    for name in names:
+        assert f"/{name}" in topic
+    assert "any channel" in topic
 
 
 # ---------------------------------------------------------------------------

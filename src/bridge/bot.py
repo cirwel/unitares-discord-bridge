@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import logging.handlers
 import os
 from datetime import datetime, timezone
 
@@ -17,6 +18,7 @@ from bridge.config import (
     DIGEST_RELATIONAL_THRESHOLD, LUMEN_OFFLINE_MENTION,
     AGENT_TAGS_TTL_SECONDS, AGENT_TAGS_NONRESIDENT_TTL_SECONDS,
     AGENT_TAGS_FAILURE_TTL_SECONDS, RESIDENT_AGENT_TAGS, EMBODIED_STATE_CHANNEL,
+    BRIDGE_LOG_PATH,
 )
 from bridge.agent_labels import AgentLabelCache
 from bridge.agent_tags import AgentTagResolver
@@ -32,10 +34,43 @@ from bridge.acks import setup_acks
 from bridge.commands import setup_commands
 from bridge.ws_events import WSEventSubscriber
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(name)s %(levelname)s %(message)s",
-)
+_LOG_FORMAT = "%(asctime)s %(name)s %(levelname)s %(message)s"
+_log_handler: logging.Handler | None = None
+
+
+def configure_logging(log_path: str = "") -> logging.Handler:
+    """Install the bridge's single root log handler and return it.
+
+    ``log_path`` set: a WatchedFileHandler on that path, which notices when
+    newsyslog renames the file and reopens the path, so the live log keeps
+    filling after rotation. Unset: stderr, as before.
+
+    httpx logs every request at INFO ("HTTP Request: ... 200 OK"); that was
+    96% of the log (304,740 of 316,327 lines). Its failures still surface
+    through our own warnings, so keep only its WARNING and above.
+
+    Safe to call again: the handler this function installed last is replaced,
+    never stacked.
+    """
+    global _log_handler
+    root = logging.getLogger()
+    if _log_handler is not None:
+        root.removeHandler(_log_handler)
+        _log_handler.close()
+    if log_path:
+        os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+        handler: logging.Handler = logging.handlers.WatchedFileHandler(log_path)
+    else:
+        handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter(_LOG_FORMAT))
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    _log_handler = handler
+    return handler
+
+
+configure_logging(BRIDGE_LOG_PATH)
 log = logging.getLogger("bridge")
 
 
@@ -261,6 +296,7 @@ async def on_ready():
         lumen_poller = LumenPoller(
             anima_client, art_ch, sensor_ch, SENSOR_POLL_INTERVAL,
             offline_mention=LUMEN_OFFLINE_MENTION,
+            cache=cache,
         )
         await lumen_poller.start()
         log.info("Lumen poller started")
@@ -384,7 +420,10 @@ def main():
         raise ValueError("DISCORD_BOT_TOKEN environment variable is required")
     setup_commands(bot, gov_client, anima_client)
     setup_acks(bot, gov_client)
-    bot.run(DISCORD_TOKEN)
+    # log_handler=None: discord.py otherwise attaches its own stderr handler
+    # to the "discord" logger, which also propagates to our root handler, so
+    # every discord.py record was written twice.
+    bot.run(DISCORD_TOKEN, log_handler=None)
 
 
 if __name__ == "__main__":

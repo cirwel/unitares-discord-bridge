@@ -532,7 +532,11 @@ def test_send_queue_express_lane_preserves_item_identity():
 
 
 def _iteration_poller(alerts_send):
-    anima = SimpleNamespace(fetch_self_iteration_attention=AsyncMock(return_value=None))
+    anima = SimpleNamespace(
+        read_self_iteration_attention=AsyncMock(
+            return_value=(None, "no response from Anima (ConnectError)")
+        )
+    )
     governance = SimpleNamespace(record_bridge_event=AsyncMock(return_value=True))
     cache = SimpleNamespace(get_kv=AsyncMock(return_value=None), set_kv=AsyncMock())
     alerts = SimpleNamespace(id=3, name="alerts", send=alerts_send)

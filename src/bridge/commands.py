@@ -20,9 +20,15 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def build_status_embed(agents: list[dict], metrics: dict[str, dict]) -> discord.Embed:
-    """Build an EISV status overview embed for all agents."""
+    """Build an EISV status overview embed for all agents.
+
+    Same body as the HUD, but a /status reply is a one-off snapshot that is
+    never edited again, so it must not be titled "Live".
+    """
     from bridge.hud import build_hud_embed
-    return build_hud_embed(agents, metrics)
+    embed = build_hud_embed(agents, metrics)
+    embed.title = "Governance status (snapshot)"
+    return embed
 
 
 def build_digest_embed(
@@ -283,7 +289,7 @@ def setup_commands(
     async def cmd_status(interaction: discord.Interaction) -> None:
         await interaction.response.defer()
         try:
-            agents = await fetch_agents(gov_client)
+            agents = await fetch_agents(gov_client, with_metrics=True)
             metrics = await fetch_metrics(gov_client, agents)
             embed = build_status_embed(agents, metrics)
             await interaction.followup.send(embed=embed)

@@ -25,6 +25,58 @@ def _is_reserved_agent_id(agent_id: str) -> bool:
     return agent_id.lower().startswith(_RESERVED_AGENT_ID_PREFIXES)
 
 
+# During an outage every poll fails the same way. Logging each one at WARNING
+# buried the log (3,572 fetch_gallery warnings from a single Lumen outage), so
+# a failure streak logs WARNING on its first failure and on every Nth after
+# that, DEBUG in between, and one INFO line when it ends.
+FAILURE_LOG_EVERY = 20
+
+
+def _cause(exc: BaseException) -> str:
+    """Typed, never-empty description of an exception.
+
+    ``str()`` of an httpx timeout is "", which left 299 of 311 failure
+    warnings with an empty cause. The repr is used only when the message is
+    empty, so a normal failure reads "ConnectError: refused" rather than
+    "ConnectError: ConnectError('refused')".
+    """
+    return f"{type(exc).__name__}: {str(exc) or repr(exc)}"
+
+
+def _failure_level(streak: int) -> int:
+    if streak == 1 or streak % FAILURE_LOG_EVERY == 0:
+        return logging.WARNING
+    return logging.DEBUG
+
+
+class _FailureStreaks:
+    """Per-key consecutive-failure counters that only gate log levels."""
+
+    def __init__(self, service: str) -> None:
+        self.service = service
+        self._streaks: dict[str, int] = {}
+
+    def failed(self, key: str, exc: BaseException, detail: str = "") -> None:
+        """``detail`` names what this attempt was for (e.g. a filename), so
+        the WARNING says which item failed even though the streak is keyed
+        by operation."""
+        streak = self._streaks.get(key, 0) + 1
+        self._streaks[key] = streak
+        what = f"{key}({detail})" if detail else key
+        log.log(
+            _failure_level(streak), "%s %s failed (%d in a row): %s",
+            self.service, what, streak, _cause(exc),
+        )
+
+    def succeeded(self, key: str) -> None:
+        streak = self._streaks.pop(key, 0)
+        if streak:
+            log.info(
+                "%s %s recovered after %d consecutive failures",
+                self.service, key, streak,
+            )
+
+
 class GovernanceClient:
     """Client for the governance-mcp HTTP API.
 
@@ -68,6 +120,25 @@ class GovernanceClient:
             await self._client.aclose()
             self._client = None
 
+    def _note_success(self) -> None:
+        if self.consecutive_failures:
+            log.info(
+                "governance recovered after %d consecutive failures",
+                self.consecutive_failures,
+            )
+        self.consecutive_failures = 0
+
+    def _note_failure(self, what: str, exc: BaseException) -> None:
+        # consecutive_failures drives the "Governance MCP Unreachable" alert
+        # and the HUD's connection line; it counts exactly as before. Only
+        # the level of this log line depends on it.
+        self.consecutive_failures += 1
+        log.log(
+            _failure_level(self.consecutive_failures),
+            "governance %s failed (%d): %s",
+            what, self.consecutive_failures, _cause(exc),
+        )
+
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is not None:
             return self._client
@@ -92,15 +163,14 @@ class GovernanceClient:
                 params={"since": since, "limit": limit},
             )
             resp.raise_for_status()
-            self.consecutive_failures = 0
+            self._note_success()
             data = resp.json()
             # /api/events wraps events in {"success": ..., "events": [...], "count": N}
             if isinstance(data, dict):
                 return data.get("events", [])
             return data if isinstance(data, list) else []
         except Exception as exc:
-            self.consecutive_failures += 1
-            log.warning("governance fetch_events failed (%d): %s", self.consecutive_failures, exc)
+            self._note_failure("fetch_events", exc)
             return None
         finally:
             if self._client is None:
@@ -122,7 +192,7 @@ class GovernanceClient:
                 return None
             return data
         except Exception as exc:
-            log.warning("governance fetch_taxonomy failed: %s", exc)
+            log.warning("governance fetch_taxonomy failed: %s", _cause(exc))
             return None
         finally:
             if self._client is None:
@@ -134,11 +204,10 @@ class GovernanceClient:
         try:
             resp = await client.get("/health")
             resp.raise_for_status()
-            self.consecutive_failures = 0
+            self._note_success()
             return resp.json()
         except Exception as exc:
-            self.consecutive_failures += 1
-            log.warning("governance fetch_health failed (%d): %s", self.consecutive_failures, exc)
+            self._note_failure("fetch_health", exc)
             return None
         finally:
             if self._client is None:
@@ -251,14 +320,13 @@ class GovernanceClient:
             )
             resp.raise_for_status()
             if track_failures:
-                self.consecutive_failures = 0
+                self._note_success()
             return resp.json()
         except Exception as exc:
             if not track_failures:
-                log.debug("governance call_tool(%s) failed (untracked): %s", tool_name, exc)
+                log.debug("governance call_tool(%s) failed (untracked): %s", tool_name, _cause(exc))
                 return None
-            self.consecutive_failures += 1
-            log.warning("governance call_tool(%s) failed (%d): %s", tool_name, self.consecutive_failures, exc)
+            self._note_failure(f"call_tool({tool_name})", exc)
             return None
         finally:
             if self._client is None:
@@ -291,17 +359,43 @@ def _scalar(value) -> float:
         return 0.0
 
 
+_HUD_VERDICTS = frozenset({"proceed", "guide", "pause", "reject"})
+
+# Mirror governance's GovernanceConfig.RISK_APPROVE_THRESHOLD (low/medium edge)
+# and RISK_REVISE_THRESHOLD (medium/high edge), which get_governance_metrics
+# uses to word risk_score.status.
+_RISK_MEDIUM = 0.45
+_RISK_HIGH = 0.70
+
+
 def _derive_verdict(data: dict) -> str:
     """Derive a HUD verdict (proceed/guide/pause/reject) from metric response.
 
     Prefers an explicit ``verdict`` field; otherwise maps from basin + risk_score.status.
     """
     verdict = data.get("verdict")
-    if isinstance(verdict, str) and verdict:
+    # Only a verdict already in the HUD's vocabulary is taken as-is. The agent
+    # list's metrics rows carry the monitor's raw verdict ("safe", "caution",
+    # "high-risk"), which the HUD has no emoji for; get_governance_metrics
+    # wraps the same value in a dict, which never matched here either. Both
+    # fall through to the basin/risk derivation below.
+    if isinstance(verdict, str) and verdict in _HUD_VERDICTS:
         return verdict
 
     risk = data.get("risk_score", {})
-    risk_status = risk.get("status", "").lower() if isinstance(risk, dict) else ""
+    if isinstance(risk, dict):
+        risk_status = str(risk.get("status") or "").lower()
+    elif isinstance(risk, (int, float)) and not isinstance(risk, bool):
+        # The agent list sends risk_score as a bare float. Bucket it the way
+        # get_governance_metrics words its status, so both sources agree.
+        if risk >= _RISK_HIGH:
+            risk_status = "high"
+        elif risk >= _RISK_MEDIUM:
+            risk_status = "medium"
+        else:
+            risk_status = "low"
+    else:
+        risk_status = ""
     # basin arrives as {"value": "low", "meaning": ..., "thresholds": {...}},
     # the same wrapped shape _scalar already unwraps for E/I/S/V. The previous
     # `str(data.get("basin"))` stringified the whole dict, so no basin
@@ -327,22 +421,38 @@ def _derive_verdict(data: dict) -> str:
 
 
 async def fetch_agents(
-    gov_client: "GovernanceClient", *, track_failures: bool = True,
+    gov_client: "GovernanceClient", *, with_metrics: bool = False,
+    track_failures: bool = True,
 ) -> list[dict]:
     """Call agent(action="list") and return normalised list of {"id": ..., "label": ...}.
 
     Sorted by last activity descending (most-recent first). Test agents are
-    filtered out by governance's lite mode; we widen the window and re-sort
-    locally so the HUD surfaces recent agents instead of "best of the best"
-    high-update ones.
+    filtered out by governance; we widen the window and re-sort locally so
+    the HUD surfaces recent agents instead of "best of the best" high-update
+    ones.
+
+    ``with_metrics=True`` asks the full list for each row's metrics in the
+    same call, and each returned dict also carries ``"metrics"`` (the row's
+    metrics, possibly None) and ``"observed"`` (it has at least one state
+    row). ``fetch_metrics`` reads the persisted-state rows among those
+    instead of calling get_governance_metrics once per agent: the HUD used
+    to make 51 calls every 30 s (about 140k a day), nearly all of the
+    bridge's governance load. Agents with a loaded monitor still get their
+    own call (see ``fetch_metrics``). Callers that only need labels keep the
+    cheaper lite listing.
 
     ``track_failures`` is passed to :meth:`GovernanceClient.call_tool`; set it
     to ``False`` for cosmetic reads that must not move the unreachable alert.
     """
+    if with_metrics:
+        arguments = {
+            "action": "list", "lite": False, "grouped": False,
+            "include_metrics": True, "limit": 50, "recent_days": 7,
+        }
+    else:
+        arguments = {"action": "list", "lite": True, "limit": 50, "recent_days": 7}
     result = await gov_client.call_tool(
-        "agent",
-        {"action": "list", "lite": True, "limit": 50, "recent_days": 7},
-        track_failures=track_failures,
+        "agent", arguments, track_failures=track_failures,
     )
     if result is None:
         return []
@@ -354,6 +464,13 @@ async def fetch_agents(
             items = data
         else:
             items = []
+        if isinstance(items, dict):
+            # The full list groups rows by lifecycle status unless told
+            # grouped=False. Flatten rather than crash if it does.
+            items = [
+                row for group in items.values() if isinstance(group, list)
+                for row in group
+            ]
         items = sorted(
             items,
             key=lambda it: it.get("last_update") or it.get("last") or "",
@@ -370,32 +487,57 @@ async def fetch_agents(
             # HUD-of-seed-values incident — 50 agents at a constant
             # E=0.70 I=0.80 S=0.20 V=0.00. Count them so a missing operator
             # token is visible in the log instead of silently degrading.
-            if item.get("uuid_redacted"):
+            # Lite rows flag it as uuid_redacted, full rows as agent_id_redacted.
+            if item.get("uuid_redacted") or item.get("agent_id_redacted"):
                 redacted += 1
             agent_id = item.get("agent_id") or item.get("id")
             if not agent_id:
                 # Skip rows without a usable id — passing "" downstream
                 # silently fires get_governance_metrics(agent_id="").
                 continue
-            label = item.get("label") or item.get("name") or agent_id
-            agents.append({"id": agent_id, "label": label})
+            # The lite listing falls back to the public handle for an
+            # unlabeled agent; the full row has no handle, so with the
+            # operator token an unlabeled agent's id is its full UUID.
+            # Shorten that rather than print 36 characters on the HUD.
+            label = item.get("label") or item.get("name") or _short_id(agent_id)
+            agent = {"id": agent_id, "label": label}
+            if with_metrics:
+                agent["metrics"] = item.get("metrics")
+                agent["observed"] = (item.get("total_updates") or 0) >= 1
+            agents.append(agent)
         if redacted:
             log.warning(
-                "agent(action='list') redacted %d/%d agent UUIDs — HUD cannot read EISV "
-                "for these. Set GOVERNANCE_OPERATOR_TOKEN (sent as "
+                "agent(action='list') redacted %d/%d agent UUIDs — the per-agent "
+                "get_governance_metrics read and /agent lookups cannot resolve "
+                "these handles. Set GOVERNANCE_OPERATOR_TOKEN (sent as "
                 "X-Unitares-Operator) to receive real UUIDs.",
                 redacted, len(items),
             )
         return agents
-    except (json.JSONDecodeError, TypeError, KeyError) as exc:
-        log.warning("Failed to parse agent(action='list'): %s", exc)
+    except (json.JSONDecodeError, TypeError, KeyError, AttributeError) as exc:
+        log.warning("Failed to parse agent(action='list'): %s", _cause(exc))
         return []
 
 
 async def fetch_metrics(
     gov_client: "GovernanceClient", agents: list[dict],
 ) -> dict[str, dict]:
-    """Fetch EISV metrics for each agent. Returns {agent_id: {E, I, S, V, verdict}}."""
+    """Fetch EISV metrics for each agent. Returns {agent_id: {E, I, S, V, verdict}}.
+
+    Agents from ``fetch_agents(..., with_metrics=True)`` carry their list
+    row's metrics. An agent with no state row (``observed`` False) has
+    nothing to read and renders as "no state", whatever the row holds: a
+    loaded 0-update monitor reports its genesis seed vector, not a reading.
+
+    A row is read without a call only when governance projected it from the
+    persisted state row (``source == "persisted_state"``). That row stores the
+    primary EISV get_governance_metrics reports (behavioral when its
+    confidence is >= 0.3, else ODE). A row built from a loaded monitor
+    (``live_monitor`` / ``restored_monitor``) carries the monitor's raw ODE
+    state instead, so those agents, and any row without a full reading, get
+    one get_governance_metrics call. Otherwise one HUD would mix two EISV
+    sources.
+    """
     metrics: dict[str, dict] = {}
     for agent in agents:
         agent_id = agent.get("id")
@@ -404,6 +546,13 @@ async def fetch_metrics(
             # (shouldn't happen post-fix), don't fire metric requests for
             # "" — they return empty dicts and pollute the HUD.
             continue
+        if "metrics" in agent:
+            if not agent.get("observed", True):
+                continue
+            row = agent.get("metrics")
+            if _has_eisv(row) and row.get("source") == _ROW_SOURCE_PERSISTED:
+                metrics[agent_id] = _metrics_entry(row)
+                continue
         if _is_reserved_agent_id(agent_id):
             # Reserved-prefix ids (e.g. a redacted "mcp_<date>_<suffix>" human
             # id from agent(action="list")) are rejected by get_governance_metrics with
@@ -432,16 +581,70 @@ async def fetch_metrics(
                     agent_id, data.get("error"), data.get("error_type"),
                 )
                 continue
-            metrics[agent_id] = {
-                "E": _scalar(data.get("E", data.get("entropy", 0.0))),
-                "I": _scalar(data.get("I", data.get("integration", 0.0))),
-                "S": _scalar(data.get("S", data.get("stability", 0.0))),
-                "V": _scalar(data.get("V", data.get("volatility", 0.0))),
-                "verdict": _derive_verdict(data),
-            }
-        except (json.JSONDecodeError, TypeError, KeyError) as exc:
-            log.warning("Failed to parse metrics for %s: %s", agent_id, exc)
+            metrics[agent_id] = _metrics_entry(data)
+        except (json.JSONDecodeError, TypeError, KeyError, AttributeError) as exc:
+            log.warning("Failed to parse metrics for %s: %s", agent_id, _cause(exc))
     return metrics
+
+
+ATTENTION_SCHEMA = "anima.self_iteration.attention.v1"
+ATTENTION_NO_RESPONSE = "no response from Anima"
+
+
+def _attention_failure_reason(data: object) -> str | None:
+    """Why a decoded attention response is unusable, or None when it is usable."""
+    if not isinstance(data, dict):
+        return f"unexpected response type {type(data).__name__}"
+    if data.get("success") is not True:
+        error = data.get("error")
+        detail = f": {str(error)[:120]}" if error else ""
+        return f"Anima reported failure{detail}"
+    result = data.get("result")
+    if not isinstance(result, dict):
+        return "result missing or not an object"
+    schema = result.get("schema")
+    if schema != ATTENTION_SCHEMA:
+        return f"schema mismatch (got {str(schema)[:80]})"
+    if not isinstance(result.get("items"), list):
+        return "items missing or not a list"
+    if (
+        result.get("acknowledgement_is_approval") is not False
+        or result.get("authority_granted") is not False
+    ):
+        return (
+            "authority flags not False "
+            f"(acknowledgement_is_approval={result.get('acknowledgement_is_approval')!r}, "
+            f"authority_granted={result.get('authority_granted')!r})"
+        )
+    return None
+
+
+# query.py _persisted_state_metrics tags its projection with this source.
+# The other sources (live_monitor, restored_monitor) read monitor.state, the
+# ODE vector, not the primary EISV get_governance_metrics returns.
+_ROW_SOURCE_PERSISTED = "persisted_state"
+
+
+def _short_id(agent_id: str) -> str:
+    """First 8 characters of a full UUID; any other id is returned as-is."""
+    if len(agent_id) == 36 and agent_id.count("-") == 4:
+        return agent_id[:8]
+    return agent_id
+
+
+def _has_eisv(row) -> bool:
+    """A list row's metrics are a reading only if all four values are present."""
+    return isinstance(row, dict) and all(row.get(k) is not None for k in "EISV")
+
+
+def _metrics_entry(data: dict) -> dict:
+    return {
+        "E": _scalar(data.get("E", data.get("entropy", 0.0))),
+        "I": _scalar(data.get("I", data.get("integration", 0.0))),
+        "S": _scalar(data.get("S", data.get("stability", 0.0))),
+        "V": _scalar(data.get("V", data.get("volatility", 0.0))),
+        "verdict": _derive_verdict(data),
+    }
 
 
 class AnimaClient:
@@ -456,6 +659,8 @@ class AnimaClient:
         self.is_online = True
         self._client: httpx.AsyncClient | None = None
         self._headers: dict[str, str] = {}
+        # Log-level gating only; is_online is unaffected.
+        self._failures = _FailureStreaks("anima")
         if token:
             self._headers["Authorization"] = f"Bearer {token}"
 
@@ -484,10 +689,11 @@ class AnimaClient:
             resp = await client.get("/state")
             resp.raise_for_status()
             self.is_online = True
+            self._failures.succeeded("fetch_state")
             return resp.json()
         except Exception as exc:
             self.is_online = False
-            log.warning("anima fetch_state failed: %s", exc)
+            self._failures.failed("fetch_state", exc)
             return None
         finally:
             if self._client is None:
@@ -503,12 +709,13 @@ class AnimaClient:
             )
             resp.raise_for_status()
             data = resp.json()
+            self._failures.succeeded("fetch_gallery")
             # /gallery wraps drawings in {"drawings": [...], "total": N, ...}
             if isinstance(data, dict):
                 return data.get("drawings", [])
             return data if isinstance(data, list) else []
         except Exception as exc:
-            log.warning("anima fetch_gallery failed: %s", exc)
+            self._failures.failed("fetch_gallery", exc)
             return None
         finally:
             if self._client is None:
@@ -520,9 +727,10 @@ class AnimaClient:
         try:
             resp = await client.get(f"/gallery/{filename}", timeout=15)
             resp.raise_for_status()
+            self._failures.succeeded("fetch_drawing_image")
             return resp.content
         except Exception as exc:
-            log.warning("anima fetch_drawing_image(%s) failed: %s", filename, exc)
+            self._failures.failed("fetch_drawing_image", exc, detail=filename)
             return None
         finally:
             if self._client is None:
@@ -540,16 +748,29 @@ class AnimaClient:
             resp = await client.get("/qa", params={"limit": limit})
             resp.raise_for_status()
             data = resp.json()
+            self._failures.succeeded("fetch_qa")
             return data if isinstance(data, dict) else None
         except Exception as exc:
-            log.warning("anima fetch_qa failed: %s", exc)
+            self._failures.failed("fetch_qa", exc)
             return None
         finally:
             if self._client is None:
                 await client.aclose()
 
     async def fetch_self_iteration_attention(self, limit: int = 50) -> dict | None:
+        """The attention projection, or None when it is unusable."""
+        result, _reason = await self.read_self_iteration_attention(limit=limit)
+        return result
+
+    async def read_self_iteration_attention(
+        self, limit: int = 50
+    ) -> tuple[dict | None, str | None]:
         """Read Anima's bounded, non-authoritative attention projection.
+
+        Returns ``(projection, None)`` when the projection is usable, otherwise
+        ``(None, reason)``. The reason says what actually failed, so an outage
+        notice does not call a rejected response "no response". Reasons for
+        transport failures start with ``ATTENTION_NO_RESPONSE``.
 
         The projection is fetched through the existing authenticated REST tool
         adapter. Only the read-only ``attention`` action is used; this client
@@ -557,31 +778,37 @@ class AnimaClient:
         """
         client = self._get_client()
         try:
-            resp = await client.post(
-                "/v1/tools/call",
-                json={
-                    "name": "self_iteration",
-                    "arguments": {"action": "attention", "limit": limit},
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            result = data.get("result") if isinstance(data, dict) else None
-            if (
-                not isinstance(data, dict)
-                or data.get("success") is not True
-                or not isinstance(result, dict)
-                or result.get("schema") != "anima.self_iteration.attention.v1"
-                or not isinstance(result.get("items"), list)
-                or result.get("acknowledgement_is_approval") is not False
-                or result.get("authority_granted") is not False
-            ):
-                log.warning("anima self-iteration attention response is unavailable")
-                return None
-            return result
+            try:
+                resp = await client.post(
+                    "/v1/tools/call",
+                    json={
+                        "name": "self_iteration",
+                        "arguments": {"action": "attention", "limit": limit},
+                    },
+                )
+            except httpx.TransportError as exc:
+                # Connection refused, DNS, timeouts: Anima never answered.
+                reason = f"{ATTENTION_NO_RESPONSE} ({type(exc).__name__})"
+                self._failures.failed("fetch_self_iteration_attention", exc)
+                return None, reason
+            if resp.status_code >= 400:
+                reason = f"HTTP {resp.status_code} from Anima"
+                log.warning("anima self-iteration attention: %s", reason)
+                return None, reason
+            try:
+                data = resp.json()
+            except ValueError:
+                log.warning("anima self-iteration attention: response is not JSON")
+                return None, "response was not JSON"
+            reason = _attention_failure_reason(data)
+            if reason is not None:
+                log.warning("anima self-iteration attention rejected: %s", reason)
+                return None, reason
+            self._failures.succeeded("fetch_self_iteration_attention")
+            return data["result"], None
         except Exception as exc:
-            log.warning("anima fetch_self_iteration_attention failed: %s", exc)
-            return None
+            self._failures.failed("fetch_self_iteration_attention", exc)
+            return None, f"unexpected error ({type(exc).__name__})"
         finally:
             if self._client is None:
                 await client.aclose()
