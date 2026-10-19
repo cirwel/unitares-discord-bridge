@@ -21,6 +21,7 @@ from bridge.embeds import (
     is_dismissed_resolution,
     is_finding_event,
 )
+from bridge.delivery import is_transient_send_error, send_with_retry
 from bridge.mcp_client import GovernanceClient, fetch_agents
 from bridge.tasks import cancel_tasks, create_logged_task
 
@@ -91,9 +92,10 @@ class EventPoller:
         self._task: asyncio.Task | None = None
         self._send_task: asyncio.Task | None = None
         self._gov_alert_sent: bool = False
-        self._message_queue: asyncio.Queue[tuple[discord.TextChannel, discord.Embed, dict | None]] = (
-            asyncio.Queue(maxsize=100)
-        )
+        # Items are (channel, embed, source_event) or, once re-queued after
+        # Discord was unreachable, (channel, embed, source_event, redeliveries).
+        self._message_queue: asyncio.Queue[tuple] = asyncio.Queue(maxsize=100)
+        self._redelivery_tasks: set[asyncio.Task] = set()
 
     def _finding_channel(self, event: dict) -> discord.TextChannel | None:
         """The one channel a finding is posted to, or ``None`` if it isn't one.
@@ -152,7 +154,7 @@ class EventPoller:
 
     async def stop(self) -> None:
         """Cancel both background tasks."""
-        await cancel_tasks(self._task, self._send_task)
+        await cancel_tasks(self._task, self._send_task, *self._redelivery_tasks)
 
     async def _poll_loop(self) -> None:
         while True:
@@ -375,15 +377,66 @@ class EventPoller:
             )
         )
 
+    async def _deliver(self, channel, embed, source_event) -> tuple[int | None, bool]:
+        """One logical send, retrying transient connection errors."""
+        async def attempt() -> tuple[int | None, bool]:
+            if self.delivery_cache is not None:
+                return await self.delivery_cache.send(channel, embed, source_event)
+            message = await channel.send(embed=embed)
+            return getattr(message, "id", None), False
+
+        return await send_with_retry(attempt, what="event poller send")
+
+    async def _redeliver_later(self, item: tuple, delay: float) -> None:
+        await asyncio.sleep(delay)
+        try:
+            self._message_queue.put_nowait(item)
+        except asyncio.QueueFull:
+            channel, _embed, source_event, *_ = item
+            await self._record_receipt(
+                "bridge.delivery_failed",
+                source_event=source_event,
+                channel=channel,
+                reason="discord_unreachable",
+                error="send queue full at redelivery",
+            )
+
+    async def _handle_unreachable(self, item: tuple, exc: BaseException) -> None:
+        """Re-queue a message Discord could not be reached for, a bounded number
+        of times; record the loss durably once redelivery is exhausted."""
+        channel, embed, source_event, *rest = item
+        redeliveries = rest[0] if rest else 0
+        if redeliveries < config.SEND_REDELIVERIES:
+            log.warning(
+                "Discord unreachable (%s); redelivery %d/%d in %.0fs",
+                exc, redeliveries + 1, config.SEND_REDELIVERIES,
+                config.SEND_REDELIVERY_DELAY_SECONDS,
+            )
+            task = create_logged_task(
+                self._redeliver_later(
+                    (channel, embed, source_event, redeliveries + 1),
+                    config.SEND_REDELIVERY_DELAY_SECONDS,
+                ),
+                name="event-redeliver",
+            )
+            self._redelivery_tasks.add(task)
+            task.add_done_callback(self._redelivery_tasks.discard)
+            return
+        log.error("Discord unreachable (%s); giving up on message", exc)
+        await self._record_receipt(
+            "bridge.delivery_failed",
+            source_event=source_event,
+            channel=channel,
+            reason="discord_unreachable",
+            error=str(exc),
+        )
+
     async def _send_loop(self) -> None:
         while True:
-            channel, embed, source_event = await self._message_queue.get()
+            item = await self._message_queue.get()
+            channel, embed, source_event, *_ = item
             try:
-                if self.delivery_cache is not None:
-                    message_id, duplicate = await self.delivery_cache.send(channel, embed, source_event)
-                else:
-                    message = await channel.send(embed=embed)
-                    message_id, duplicate = getattr(message, "id", None), False
+                message_id, duplicate = await self._deliver(channel, embed, source_event)
                 await self._record_receipt(
                     "bridge.suppressed" if duplicate else "bridge.delivery",
                     source_event=source_event,
@@ -427,8 +480,14 @@ class EventPoller:
                         error=str(exc),
                     )
             except Exception as exc:
-                # Anything not covered above (transport-layer errors, malformed
-                # embed state) must not kill the send loop: the poll loop keeps
+                if is_transient_send_error(exc):
+                    # Retries inside _deliver are spent; re-queue (bounded)
+                    # instead of dropping the message on a DNS blip.
+                    await self._handle_unreachable(item, exc)
+                    await asyncio.sleep(0.15)
+                    continue
+                # Anything not covered above (malformed embed state, etc.)
+                # must not kill the send loop: the poll loop keeps
                 # running and the heartbeat stays fresh, so a dead sender is a
                 # silent Discord outage the watchdog can't see. Log, record,
                 # drop this message, keep draining the queue.

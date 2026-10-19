@@ -173,6 +173,22 @@ SUPPRESS_DISMISSED_RESOLUTIONS = os.environ.get(
     "BRIDGE_SUPPRESS_DISMISSED_RESOLUTIONS", "true"
 ).lower() in ("1", "true", "yes", "on")
 
+# Transient Discord connection failures (DNS blips: "Cannot connect to host
+# discord.com:443") — see bridge/delivery.py. Each send is tried
+# BRIDGE_SEND_ATTEMPTS times with exponential backoff starting at
+# BRIDGE_SEND_RETRY_BACKOFF_SECONDS; a message that still fails is re-queued up
+# to BRIDGE_SEND_REDELIVERIES times, BRIDGE_SEND_REDELIVERY_DELAY_SECONDS apart
+# (defaults ride out roughly a five-minute outage), before the loss is recorded
+# as bridge.delivery_failed / discord_unreachable.
+SEND_ATTEMPTS = int(os.environ.get("BRIDGE_SEND_ATTEMPTS", "3"))
+SEND_RETRY_BACKOFF_SECONDS = float(
+    os.environ.get("BRIDGE_SEND_RETRY_BACKOFF_SECONDS", "1")
+)
+SEND_REDELIVERIES = int(os.environ.get("BRIDGE_SEND_REDELIVERIES", "5"))
+SEND_REDELIVERY_DELAY_SECONDS = float(
+    os.environ.get("BRIDGE_SEND_REDELIVERY_DELAY_SECONDS", "60")
+)
+
 
 def _channel_key(raw: str) -> str:
     """Normalise a resident key into a Discord-legal text channel name."""

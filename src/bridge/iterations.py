@@ -17,6 +17,7 @@ import discord
 
 from bridge import config
 from bridge.cache import BridgeCache
+from bridge.delivery import TRANSIENT_SEND_ERRORS, send_with_retry
 from bridge.mcp_client import AnimaClient, GovernanceClient
 from bridge.tasks import cancel_tasks, create_logged_task
 
@@ -27,6 +28,10 @@ SEEN_CACHE_KEY = "lumen_self_iteration_seen_v1"
 MAX_SEEN_DELIVERIES = 2_000
 _ATTENTION_ID = re.compile(r"si-attn-[0-9a-f]{24}")
 _PRIORITIES = {"critical", "high", "medium", "low"}
+# A connection failure (DNS blip: "Cannot connect to host discord.com:443")
+# is not a discord.HTTPException. Catching only the latter let it escape the
+# outage notice as a traceback on every poll while the network was down.
+_SEND_ERRORS = (discord.HTTPException, *TRANSIENT_SEND_ERRORS)
 
 
 def _text(value: object, *, limit: int) -> str:
@@ -305,9 +310,13 @@ class LumenIterationPoller:
             timestamp=datetime.now(timezone.utc),
         )
         try:
-            await self.alerts_channel.send(embed=embed)
+            await send_with_retry(
+                lambda: self.alerts_channel.send(embed=embed),
+                what="self-iteration outage notice",
+            )
             self._unavailable_announced = True
-        except discord.HTTPException as exc:
+        except _SEND_ERRORS as exc:
+            # Not announced, so the next failing poll tries again.
             log.warning("Failed to announce self-iteration outage: %s", exc)
 
     async def _announce_recovery(self) -> None:
@@ -320,8 +329,11 @@ class LumenIterationPoller:
             timestamp=datetime.now(timezone.utc),
         )
         try:
-            await self.iterations_channel.send(embed=embed)
-        except discord.HTTPException as exc:
+            await send_with_retry(
+                lambda: self.iterations_channel.send(embed=embed),
+                what="self-iteration recovery notice",
+            )
+        except _SEND_ERRORS as exc:
             log.warning("Failed to announce self-iteration recovery: %s", exc)
             return
         self._unavailable_announced = False
@@ -353,8 +365,12 @@ class LumenIterationPoller:
                 if delivery_id in self._seen:
                     continue
                 try:
-                    message = await channel.send(embed=embed)
-                except discord.HTTPException as exc:
+                    message = await send_with_retry(
+                        lambda ch=channel: ch.send(embed=embed),
+                        what="self-iteration delivery",
+                    )
+                except _SEND_ERRORS as exc:
+                    # Not remembered, so the next poll retries this delivery.
                     log.warning(
                         "Self-iteration delivery failed for %s to %s: %s",
                         item["attention_id"],

@@ -34,6 +34,7 @@ import websockets.exceptions
 
 from bridge import config
 from bridge.cache import FindingDeliveryCache
+from bridge.delivery import is_transient_send_error, send_with_retry
 from bridge.embeds import (
     attention_severity, event_to_embed, finding_destination,
     finding_needs_operator, is_critical_event, is_dismissed_resolution,
@@ -356,9 +357,10 @@ class WSEventSubscriber:
         self._sub_task: Optional[asyncio.Task] = None
         self._send_task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
-        self._send_queue: asyncio.Queue[tuple[discord.TextChannel, discord.Embed, dict | None]] = (
-            asyncio.Queue(maxsize=_SEND_QUEUE_MAX)
-        )
+        # Items are (channel, embed, source_event) or, once re-queued after
+        # Discord was unreachable, (channel, embed, source_event, redeliveries).
+        self._send_queue: asyncio.Queue[tuple] = asyncio.Queue(maxsize=_SEND_QUEUE_MAX)
+        self._redelivery_tasks: set[asyncio.Task] = set()
         # (event_type, agent_id) -> (monotonic ts of last post, metric value)
         # for repeat-drift suppression; see _suppress_repeat_drift().
         self._drift_last: dict[tuple[str, str], tuple[float, Optional[float]]] = {}
@@ -409,7 +411,10 @@ class WSEventSubscriber:
 
     async def stop(self) -> None:
         self._stop_event.set()
-        await cancel_tasks(self._sub_task, self._send_task)
+        await cancel_tasks(
+            self._sub_task, self._send_task,
+            *getattr(self, "_redelivery_tasks", ()),
+        )
 
     async def _subscribe_loop(self) -> None:
         delay = self.reconnect_initial
@@ -626,18 +631,74 @@ class WSEventSubscriber:
             )
         )
 
+    async def _deliver(self, channel, embed, source_event) -> tuple[int | None, bool]:
+        """One logical send, retrying transient connection errors."""
+        cache = getattr(self, "delivery_cache", None)
+
+        async def attempt() -> tuple[int | None, bool]:
+            if cache is not None:
+                return await cache.send(channel, embed, source_event)
+            message = await channel.send(embed=embed)
+            return getattr(message, "id", None), False
+
+        return await send_with_retry(attempt, what="WS events send")
+
+    async def _redeliver_later(self, item: tuple, delay: float) -> None:
+        await asyncio.sleep(delay)
+        try:
+            self._send_queue.put_nowait(item)
+        except asyncio.QueueFull:
+            channel, _embed, source_event, *_ = item
+            await self._record_receipt(
+                "bridge.delivery_failed",
+                source_event=source_event,
+                channel=channel,
+                reason="discord_unreachable",
+                error="send queue full at redelivery",
+            )
+
+    async def _handle_unreachable(self, item: tuple, exc: BaseException) -> None:
+        """Re-queue a message Discord could not be reached for, a bounded number
+        of times; record the loss durably once redelivery is exhausted."""
+        channel, embed, source_event, *rest = item
+        redeliveries = rest[0] if rest else 0
+        if redeliveries < config.SEND_REDELIVERIES:
+            log.warning(
+                "WS events: Discord unreachable (%s); redelivery %d/%d in %.0fs",
+                exc, redeliveries + 1, config.SEND_REDELIVERIES,
+                config.SEND_REDELIVERY_DELAY_SECONDS,
+            )
+            tasks = getattr(self, "_redelivery_tasks", None)
+            if tasks is None:
+                tasks = self._redelivery_tasks = set()
+            task = create_logged_task(
+                self._redeliver_later(
+                    (channel, embed, source_event, redeliveries + 1),
+                    config.SEND_REDELIVERY_DELAY_SECONDS,
+                ),
+                name="ws-events-redeliver",
+            )
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+            return
+        log.error("WS events: Discord unreachable (%s); giving up on message", exc)
+        await self._record_receipt(
+            "bridge.delivery_failed",
+            source_event=source_event,
+            channel=channel,
+            reason="discord_unreachable",
+            error=str(exc),
+        )
+
     async def _send_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
-                channel, embed, source_event = await self._send_queue.get()
+                item = await self._send_queue.get()
             except asyncio.CancelledError:
                 raise
+            channel, embed, source_event, *_ = item
             try:
-                if getattr(self, "delivery_cache", None) is not None:
-                    message_id, duplicate = await self.delivery_cache.send(channel, embed, source_event)
-                else:
-                    message = await channel.send(embed=embed)
-                    message_id, duplicate = getattr(message, "id", None), False
+                message_id, duplicate = await self._deliver(channel, embed, source_event)
                 await self._record_receipt(
                     "bridge.suppressed" if duplicate else "bridge.delivery",
                     source_event=source_event,
@@ -693,8 +754,14 @@ class WSEventSubscriber:
                         error=str(exc),
                     )
             except Exception as exc:
-                # Anything not covered above (transport-layer errors, malformed
-                # embed state) must not kill the send loop: the poll/subscribe
+                if is_transient_send_error(exc):
+                    # Retries inside _deliver are spent; re-queue (bounded)
+                    # instead of dropping the message on a DNS blip.
+                    await self._handle_unreachable(item, exc)
+                    await asyncio.sleep(0.15)
+                    continue
+                # Anything not covered above (malformed embed state, etc.)
+                # must not kill the send loop: the poll/subscribe
                 # side keeps running and the heartbeat stays fresh, so a dead
                 # sender is a silent Discord outage the watchdog can't see.
                 # Log, record, drop this message, keep draining the queue.

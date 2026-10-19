@@ -66,6 +66,19 @@ non-operator callers and substitutes a display handle, and a display handle is
 not a valid `agent_id` for `get_governance_metrics`. Without the operator token
 the HUD lists agents but reports "no state" for every one of them.
 
+### Delivery retries
+
+A send that fails because Discord could not be reached at all (DNS blip,
+refused or timed-out connection) is retried `BRIDGE_SEND_ATTEMPTS` times
+(default 3) with exponential backoff from `BRIDGE_SEND_RETRY_BACKOFF_SECONDS`
+(default 1). If it still fails, the event and WebSocket feeds re-queue it up to
+`BRIDGE_SEND_REDELIVERIES` times (default 5), `BRIDGE_SEND_REDELIVERY_DELAY_SECONDS`
+apart (default 60), which rides out a few minutes of outage. Only then is the
+loss recorded as a `bridge.delivery_failed` receipt with reason
+`discord_unreachable`. Rate limits and errors Discord actually returned keep
+their existing handling. Re-queued messages live in memory, so a restart during
+an outage still loses them.
+
 ### Resident channels
 
 Findings are routed by their author. Residents listed in

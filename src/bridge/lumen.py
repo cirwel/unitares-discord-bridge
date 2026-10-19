@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 
 import discord
 
+from bridge.delivery import send_with_retry
 from bridge.mcp_client import AnimaClient
 from bridge.tasks import cancel_tasks, create_logged_task
 
@@ -153,8 +154,13 @@ class LumenPoller:
                         timestamp=datetime.now(timezone.utc),
                     )
                     embed.description = "Unable to reach Lumen's sensor interface."
-                    await self.sensor_channel.send(
-                        embed=embed, **self._alert_kwargs()
+                    # Retried on a DNS blip; if it still fails, _was_offline
+                    # stays False and the next tick tries again.
+                    await send_with_retry(
+                        lambda: self.sensor_channel.send(
+                            embed=embed, **self._alert_kwargs()
+                        ),
+                        what="Lumen offline notice",
                     )
                     self._was_offline = True
                     self._sensor_msg = None
@@ -169,8 +175,11 @@ class LumenPoller:
                     recovery.description = "Lumen's sensor interface is reachable again."
                     # Ping the recovery too: whoever got woken by the outage
                     # should not have to poll Discord to learn it is over.
-                    await self.sensor_channel.send(
-                        embed=recovery, **self._alert_kwargs()
+                    await send_with_retry(
+                        lambda: self.sensor_channel.send(
+                            embed=recovery, **self._alert_kwargs()
+                        ),
+                        what="Lumen recovery notice",
                     )
                     self._sensor_msg = None
                 self._was_offline = False
