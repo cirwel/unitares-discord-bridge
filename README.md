@@ -133,6 +133,24 @@ channel whose job changes stops advertising the old one. Set
 needs Manage Channels to rewrite a topic; without it the edit is logged and
 skipped.
 
+### Operator-managed channels
+
+`DISCORD_LEASE_PLANE_PHASE_B_CHANNEL_ID` (optional) is the id of a channel the
+operator creates and names. When it is set, Sentinel's lease-plane Phase B
+transitions (`lease_plane_phase_b_finding`, and the older
+`lease_plane_phase_b_transition`) arriving over the WebSocket are posted there
+once, instead of to `#residents`/`#signals`; unset, they take that ordinary
+route. They never page `#alerts`. The channel is looked up by id, so the
+operator may rename it without a configuration change; the bridge never
+creates, renames or deletes it, and the startup log prints the name it
+resolved. The channel may stay quiet: governance's finding route accepts only
+`*_finding` types, so a producer that sends the `_transition` name is rejected
+at ingest.
+
+Any other channel on the server that is not in the declared structure (for
+example an old all-events feed) is left alone: the bridge neither posts to it
+nor archives, renames or deletes it.
+
 ### Logging
 
 The bridge logs to stderr unless `BRIDGE_LOG_PATH` names a file. With it set,

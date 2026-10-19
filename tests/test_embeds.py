@@ -74,11 +74,11 @@ def test_sentinel_finding_embed():
         "violation_class": "BEH", "finding_type": "coordinated_degradation",
     }
     embed = event_to_embed(event)
-    assert embed.title == "Sentinel Finding"
+    assert embed.title == "Sentinel Finding · coordinated_degradation"
     assert embed.colour == discord.Colour.red()  # high → critical colour
     field_names = [f.name for f in embed.fields]
     assert "Violation" in field_names
-    assert "Finding" in field_names
+    assert "Finding" not in field_names  # the finding type is in the title
 
 
 def test_vigil_finding_embed():
@@ -90,7 +90,7 @@ def test_vigil_finding_embed():
         "finding_type": "governance_down",
     }
     embed = event_to_embed(event)
-    assert embed.title == "Vigil Finding"
+    assert embed.title == "Vigil Finding · governance_down"
     assert embed.colour == discord.Colour.red()
 
 
@@ -104,10 +104,153 @@ def test_watcher_finding_embed():
         "violation_class": "INT",
     }
     embed = event_to_embed(event)
-    assert embed.title == "Watcher Finding"
+    assert embed.title == "Watcher Finding · P011"
     field_names = [f.name for f in embed.fields]
-    assert "Pattern" in field_names
-    assert "Location" in field_names
+    # The message already opens "[P011] /tmp/foo.py:42", so neither repeats.
+    assert "Pattern" not in field_names
+    assert "Location" not in field_names
+    assert "Violation" in field_names
+
+
+def test_watcher_location_field_when_message_lacks_path():
+    embed = event_to_embed({
+        "type": "watcher_finding", "severity": "high", "message": "mutation before persistence",
+        "pattern": "P011", "file": "/Users/someone/projects/unitares/src/a.py", "line": 7,
+    })
+    fields = {f.name: f.value for f in embed.fields}
+    assert fields["Location"] == "unitares/src/a.py:7"
+
+
+# ---------------------------------------------------------------------------
+# Phone-readable finding embeds: titles, paths, fingerprints, resolutions and
+# timestamps (payload shapes from unitares scripts/ops/doctor_findings.py,
+# agents/watcher/findings.py + agent.py and agents/sentinel/agent.py).
+# ---------------------------------------------------------------------------
+
+from datetime import datetime, timezone
+
+import pytest
+
+from bridge.embeds import parse_event_timestamp, short_fingerprint
+
+
+def _fields(embed):
+    return {f.name: f.value for f in embed.fields}
+
+
+def test_doctor_finding_titles_by_check_and_drops_repeated_prefix():
+    embed = event_to_embed({
+        "type": "doctor_check_finding", "severity": "warning", "event_id": 3,
+        "message": "lumen_checkin: no check-in for 42m — last seen 09:12",
+        "check": "lumen_checkin", "agent_name": "doctor",
+        "fingerprint": "9f86d081884c7d65",
+        "timestamp": "2026-10-19T09:54:00+00:00",
+    })
+    assert embed.title == "Doctor Check Finding · lumen_checkin"
+    assert embed.description == "no check-in for 42m — last seen 09:12"
+    assert _fields(embed)["Fingerprint"] == "`9f86d081884c7d65`"
+    assert embed.footer.text == "doctor_check_finding"
+    assert "Event #" not in embed.footer.text
+
+
+def test_watcher_finding_shows_path_once_repo_relative_and_close_hint():
+    fp = "a1b2c3d4e5f60718"
+    path = "/Users/someone/projects/wt/unitares-fix/src/handlers.py"
+    embed = event_to_embed({
+        "type": "watcher_finding", "severity": "high", "event_id": 9,
+        "message": f"[P011] {path}:42 — mutation before persistence",
+        "agent_name": "Watcher", "fingerprint": fp,
+        "pattern": "P011", "file": path, "line": 42, "violation_class": "INT",
+    })
+    assert embed.title == "Watcher Finding · P011"
+    assert embed.description == (
+        "[P011] unitares-fix/src/handlers.py:42 — mutation before persistence"
+    )
+    fields = _fields(embed)
+    assert "Location" not in fields and "Pattern" not in fields
+    assert fields["Fingerprint"] == f"`{fp}`"
+    assert fields["Close"] == f"`--resolve {fp}` or `--dismiss {fp}`"
+
+
+def test_sentinel_forced_release_finding_title_and_free_text_fingerprint():
+    event_uuid = "6f1c2d3e-4a5b-4c6d-8e7f-90a1b2c3d4e5"
+    embed = event_to_embed({
+        "type": "sentinel_alarm_finding", "severity": "high", "event_id": 12,
+        "message": "forced release of lease abc", "agent_name": "Sentinel",
+        "alarm_kind": "ad_hoc",
+        "fingerprint": f"forced_release:ad_hoc:{event_uuid}",
+        "evidence": {"kind": "forced_release", "assessment": "no_lease_row"},
+    })
+    assert embed.title == "Sentinel Alarm Finding · ad_hoc"
+    fields = _fields(embed)
+    assert fields["Fingerprint"] == f"`…{event_uuid[-24:]}`"
+    assert "Event check" in fields
+    assert "Close" not in fields
+
+
+@pytest.mark.parametrize("raw, shown", [
+    ("9f86d081884c7d65", "9f86d081884c7d65"),
+    ("x" * 24, "x" * 24),
+    ("sha256:" + "ab" * 32, "ab" * 8),
+    ("0123456789abcdef" * 4, "0123456789abcdef"),
+    ("forced_release:conflict_batch:s1:2026-10-19T09:00:00+00:00", "…026-10-19T09:00:00+00:00"),
+    ("", None),
+    (None, None),
+])
+def test_short_fingerprint(raw, shown):
+    assert short_fingerprint(raw) == shown
+
+
+def test_confirmed_resolution_renders_green_with_was_severity_and_action():
+    embed = event_to_embed({
+        "type": "watcher_resolution_finding", "severity": "high",
+        "message": "[confirmed] P011 /Users/someone/projects/unitares/src/a.py:42 — hint · fixed in #12",
+        "agent_name": "Watcher", "fingerprint": "a1b2c3d4e5f60718",
+        "action": "confirmed", "pattern": "P011",
+        "file": "/Users/someone/projects/unitares/src/a.py", "line": 42,
+        "resolution_reason": "fixed in #12",
+    })
+    assert embed.colour == discord.Colour.green()
+    assert embed.title == "Resolved · P011"
+    fields = _fields(embed)
+    assert fields["Severity"] == "resolved (was high)"
+    assert fields["Action"] == "confirmed: fixed in #12"
+    assert "Close" not in fields
+    assert "Location" not in fields
+    assert "unitares/src/a.py:42" in embed.description
+
+
+def test_dismissed_resolution_renders_grey():
+    embed = event_to_embed({
+        "type": "watcher_resolution_finding", "severity": "critical",
+        "message": "[dismissed] P003 x.py:1 — hint", "action": "dismissed",
+        "pattern": "P003", "agent_name": "Watcher", "fingerprint": "0011223344556677",
+    })
+    assert embed.colour == discord.Colour.light_grey()
+    assert embed.title == "Resolved · P003"
+    assert _fields(embed)["Severity"] == "resolved (was critical)"
+    assert _fields(embed)["Action"] == "dismissed"
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("2026-10-19T09:54:00+00:00", datetime(2026, 10, 19, 9, 54, tzinfo=timezone.utc)),
+    ("2026-10-19T09:54:00Z", datetime(2026, 10, 19, 9, 54, tzinfo=timezone.utc)),
+    ("2026-10-19T09:54:00", datetime(2026, 10, 19, 9, 54, tzinfo=timezone.utc)),
+    ("2026-10-19T03:54:00-06:00", datetime(2026, 10, 19, 9, 54, tzinfo=timezone.utc)),
+    (None, None),
+    ("", None),
+    ("not a time", None),
+    (1708700000, None),
+])
+def test_parse_event_timestamp(raw, expected):
+    assert parse_event_timestamp(raw) == expected
+
+
+@pytest.mark.parametrize("raw", [None, "garbage", "2026-10-19T09:54:00Z"])
+def test_embed_timestamp_never_breaks_rendering(raw):
+    embed = event_to_embed({"type": "verdict_change", "timestamp": raw, "from": "a", "to": "b"})
+    assert embed.timestamp == parse_event_timestamp(raw)
+    assert embed.footer.text == "verdict_change"
 
 
 def test_high_and_critical_findings_route_to_alerts():
@@ -310,3 +453,29 @@ def test_finding_resident_key_ignores_non_findings():
     assert finding_resident_key({
         "type": "verdict_change", "agent_id": "sentinel",
     }) is None
+
+
+def test_short_path_only_shortens_the_home_projects_directory():
+    from bridge.embeds import short_path
+
+    assert short_path("/Users/x/projects/unitares/src/a.py") == "unitares/src/a.py"
+    assert short_path("/home/x/projects/wt/unitares-fix/a.py") == "unitares-fix/a.py"
+    # A "projects" directory elsewhere keeps its location.
+    assert (
+        short_path("/Users/x/.claude/projects/-Users-x/memory/a.md")
+        == "~/.claude/projects/-Users-x/memory/a.md"
+    )
+    assert short_path("/srv/projects/app/a.py") == "/srv/projects/app/a.py"
+
+
+@pytest.mark.parametrize("fingerprint, rendered", [
+    ("abc`def", "`` abc`def ``"),
+    ("`edge`", "`` `edge` ``"),
+    ("a``b", "`a\u02cb\u02cbb`"),
+])
+def test_fingerprint_with_backticks_keeps_a_valid_code_span(fingerprint, rendered):
+    embed = event_to_embed({
+        "type": "vigil_finding", "severity": "low", "fingerprint": fingerprint,
+        "message": "m",
+    })
+    assert _fields(embed)["Fingerprint"] == rendered

@@ -33,12 +33,14 @@ import websockets
 import websockets.exceptions
 
 from bridge import config
+from bridge.agent_labels import AgentLabelCache
 from bridge.cache import FindingDeliveryCache
 from bridge.delivery import DiscordSender
 from bridge.embeds import (
     attention_severity, event_to_embed, finding_destination,
-    finding_needs_operator, is_critical_event, is_dismissed_resolution,
-    is_finding_event,
+    PHASE_B_TYPES, finding_needs_operator, is_critical_event,
+    is_dismissed_resolution, is_finding_event, parse_event_timestamp,
+    phase_b_title_colour,
 )
 from bridge.mcp_client import GovernanceClient
 
@@ -104,6 +106,67 @@ def ws_url_from_http(http_url: str) -> str:
     return u + "/ws/eisv"
 
 
+# Keys that name an event's subject. ``label`` is what governance's lifecycle
+# broadcasts (lifecycle_silent*, lifecycle_resident_paused) carry.
+_AGENT_NAME_KEYS = (
+    "resident_name",
+    "resident_label",
+    "agent_label",
+    "agent_name",
+    "label",
+)
+
+
+def _event_agent_name(event: dict) -> Optional[str]:
+    for key in _AGENT_NAME_KEYS:
+        value = event.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _format_minutes(value: object) -> str:
+    """``95m`` / ``3.5h`` / ``2.1d`` for a minute count; ``str()`` otherwise."""
+    try:
+        minutes = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return str(value)
+    if minutes < 120:
+        return f"{minutes:.0f}m"
+    if minutes < 2880:
+        return f"{minutes / 60:.1f}h"
+    return f"{minutes / 1440:.1f}d"
+
+
+def _lifecycle_description(phase: str, event: dict) -> str:
+    """Say how long and why, instead of an empty ``reason``."""
+    if phase in ("silent", "silent_critical"):
+        silence = event.get("silence_duration_minutes")
+        if silence is not None:
+            text = f"Silent {_format_minutes(silence)}"
+            expected = event.get("expected_interval_minutes")
+            if expected:
+                text += f" (expected every {_format_minutes(expected)})"
+            if event.get("proxy_alive"):
+                text += "; host proxy is alive"
+            return text
+    elif phase == "resident_paused":
+        paused = event.get("paused_minutes")
+        text = f"Paused {_format_minutes(paused)}" if paused is not None else "Paused (duration unknown)"
+        note = event.get("note")
+        return f"{text}: {note}" if note else text
+    return event.get("reason") or ""
+
+
+def _normalised(text: str) -> str:
+    return "".join(ch for ch in text.lower() if ch.isalnum())
+
+
+def _title_repeats_type(title: str, event_type: str) -> bool:
+    """True when the title already says what the raw event type says."""
+    return _normalised(event_type) in _normalised(title)
+
+
 def _colour_for_tags(tags: list[str]) -> discord.Colour:
     lower = {str(t).lower() for t in tags}
     if "critical" in lower:
@@ -124,7 +187,9 @@ def broadcaster_event_to_embed(event: dict) -> Optional[discord.Embed]:
     t = event.get("type") or ""
     if not t or t == "eisv_update":
         return None
-    if is_finding_event(event):
+    # Phase B has its own renderer whichever name it arrives under; the
+    # `_finding` one would otherwise take the generic finding path.
+    if is_finding_event(event) and t not in PHASE_B_TYPES:
         return event_to_embed({
             **event,
             "severity": attention_severity(event, critical=is_critical_broadcaster_event(event)),
@@ -132,12 +197,7 @@ def broadcaster_event_to_embed(event: dict) -> Optional[discord.Embed]:
 
     agent_id = event.get("resident_id") or event.get("agent_id") or ""
     short_id = str(agent_id)[:12] if agent_id else ""
-    agent_name = (
-        event.get("resident_name")
-        or event.get("resident_label")
-        or event.get("agent_label")
-        or event.get("agent_name")
-    )
+    agent_name = _event_agent_name(event)
     if agent_name and short_id and str(agent_name) not in (str(agent_id), short_id):
         agent = f"{agent_name} ({short_id})"
     elif agent_name:
@@ -153,10 +213,10 @@ def broadcaster_event_to_embed(event: dict) -> Optional[discord.Embed]:
     if t.startswith("lifecycle_"):
         phase = t[len("lifecycle_"):]
         title = f"Lifecycle: {phase.replace('_', ' ')}"
-        description = event.get("reason") or ""
-        if phase in ("paused", "stuck_detected", "silent_critical"):
+        description = _lifecycle_description(phase, event)
+        if phase in ("paused", "stuck_detected", "silent_critical", "resident_paused"):
             colour = discord.Colour.red()
-        elif phase == "loop_detected":
+        elif phase in ("loop_detected", "silent"):
             colour = discord.Colour.orange()
         elif phase == "resumed":
             colour = discord.Colour.green()
@@ -196,19 +256,8 @@ def broadcaster_event_to_embed(event: dict) -> Optional[discord.Embed]:
         title = f"Circuit breaker {action}"
         description = event.get("reason") or ""
         colour = discord.Colour.red() if action == "tripped" else discord.Colour.green()
-    elif t == "lease_plane_phase_b_transition":
-        surface_kind = event.get("surface_kind") or "?"
-        promotable_now = event.get("promotable_now")
-        promotable_before = event.get("promotable_before")
-        if promotable_now is True and promotable_before is not True:
-            title = f"Phase B PROMOTABLE: {surface_kind}"
-            colour = discord.Colour.green()
-        elif promotable_before is True and promotable_now is not True:
-            title = f"Phase B regression: {surface_kind}"
-            colour = discord.Colour.red()
-        else:
-            title = f"Phase B criterion change: {surface_kind}"
-            colour = discord.Colour.blurple()
+    elif t in PHASE_B_TYPES:
+        title, colour = phase_b_title_colour(event)
         description = event.get("message") or ""
 
     # Discord embed description cap is 4096 chars; be defensive.
@@ -217,7 +266,8 @@ def broadcaster_event_to_embed(event: dict) -> Optional[discord.Embed]:
 
     embed = discord.Embed(title=title, description=description, colour=colour)
     embed.add_field(name="Agent", value=str(agent), inline=True)
-    embed.add_field(name="Type", value=t, inline=True)
+    if not _title_repeats_type(title, t):
+        embed.add_field(name="Type", value=t, inline=True)
     if is_critical_broadcaster_event(event):
         embed.add_field(name="Severity", value=attention_severity(event, critical=True), inline=True)
     if t == "lifecycle_silent_critical":
@@ -226,8 +276,10 @@ def broadcaster_event_to_embed(event: dict) -> Optional[discord.Embed]:
             value="Verify expected cadence and last completed work. Silence alone is not proof of a service outage.",
             inline=False,
         )
-    if ts:
-        embed.set_footer(text=str(ts))
+    # Time goes in the embed timestamp (rendered in the reader's zone); the
+    # footer is the stable machine type, not a raw ISO string.
+    embed.timestamp = parse_event_timestamp(ts)
+    embed.set_footer(text=t)
     return embed
 
 
@@ -324,9 +376,13 @@ class WSEventSubscriber:
         resident_channels: Optional[dict[str, discord.TextChannel]] = None,
         residents_channel: Optional[discord.TextChannel] = None,
         delivery_cache: FindingDeliveryCache | None = None,
+        label_cache: AgentLabelCache | None = None,
     ) -> None:
         self.ws_url = ws_url_from_http(governance_url)
         self.gov = gov_client
+        # Names a subject that arrives with only an agent_id; None leaves the
+        # UUID fragment.
+        self.label_cache = label_cache
         self.delivery_cache = delivery_cache
         self.residents_channel = residents_channel
         self.activity_channel = activity_channel
@@ -334,7 +390,7 @@ class WSEventSubscriber:
         self.alerts_channel = alerts_channel
         # Per-class channels: {"INT": channel, "ENT": channel, ...}. When a
         # matched event has a class in this map, it's ALSO posted to that
-        # channel (in addition to the main #events feed). Disabled by passing
+        # channel (in addition to its #activity/#signals post). Disabled by passing
         # None or an empty dict.
         self.class_channels = class_channels or {}
         # Per-resident finding channels: {"sentinel": channel, ...}. A finding
@@ -343,10 +399,10 @@ class WSEventSubscriber:
         # without an entry use the same #residents fallback as REST when wired.
         self.resident_channels = resident_channels or {}
         self.taxonomy_reverse = taxonomy_reverse or {}
-        # Operator-managed channel for lease_plane_phase_b_transition events
-        # emitted by Sentinel after a §6.1 criterion (or overall promotable)
-        # flips status. None disables; events still flow via the default
-        # activity/signals path.
+        # Operator-managed channel (#lease-plane-phase-b, looked up by id) for
+        # the PHASE_B_TYPES events Sentinel emits after a §6.1 criterion (or
+        # overall promotable) flips status. None disables; events still flow
+        # via the default signals/resident-findings path.
         self.lease_plane_phase_b_channel = lease_plane_phase_b_channel
         self.reconnect_initial = reconnect_initial
         self.reconnect_max = reconnect_max
@@ -427,6 +483,18 @@ class WSEventSubscriber:
     async def stop(self) -> None:
         self._stop_event.set()
         await cancel_tasks(self._sub_task, self._send_task)
+        if self.label_cache is not None:
+            await self.label_cache.close()
+
+    async def _with_agent_label(self, event: dict) -> dict:
+        """Add ``agent_label`` from the label cache when the event names no one."""
+        if self.label_cache is None or _event_agent_name(event):
+            return event
+        agent_id = event.get("resident_id") or event.get("agent_id")
+        if not agent_id:
+            return event
+        label = await self.label_cache.label_for(agent_id)
+        return {**event, "agent_label": label} if label else event
 
     async def _subscribe_loop(self) -> None:
         delay = self.reconnect_initial
@@ -514,7 +582,9 @@ class WSEventSubscriber:
                 reason="repeat_drift",
             )
             return
-        embed = broadcaster_event_to_embed(event)
+        if not event.get("type") or event.get("type") == "eisv_update":
+            return
+        embed = broadcaster_event_to_embed(await self._with_agent_label(event))
         if embed is None:
             return
         bucket = classify_broadcaster_event(event)
@@ -522,6 +592,17 @@ class WSEventSubscriber:
         resident_ch = self._resident_channel(event)
         if resident_ch is not None:
             target = resident_ch
+        # Lease-plane Phase B transitions: the narrow stream of "criterion N
+        # flipped" / "PROMOTABLE" / "REGRESSED" posts Sentinel emits. Low
+        # volume (<=5 per surface_kind over the pre-promotion lifetime) but
+        # high signal, so when the operator has wired a channel for them it is
+        # their one destination, in place of #residents/#signals. Unset, they
+        # take the ordinary route above.
+        if (
+            event.get("type") in PHASE_B_TYPES
+            and self.lease_plane_phase_b_channel is not None
+        ):
+            target = self.lease_plane_phase_b_channel
         try:
             self._send_queue.put_nowait((target, embed, event))
         except asyncio.QueueFull:
@@ -553,7 +634,7 @@ class WSEventSubscriber:
         # Per-class mirror: when an event maps to a violation class and the
         # bridge has a channel for it, post there too. This is the core value
         # of class routing — operators can subscribe to a subset of classes
-        # without seeing every event in #events.
+        # without reading all of #activity and #signals.
         class_id = resolve_violation_class(event, self.taxonomy_reverse)
         if class_id:
             cls_channel = self.class_channels.get(class_id)
@@ -567,27 +648,6 @@ class WSEventSubscriber:
                         channel=cls_channel,
                         reason="send_queue_full",
                     )
-
-        # Lease-plane Phase B transition mirror: a dedicated channel for the
-        # narrow stream of "criterion N flipped" / "PROMOTABLE" / "REGRESSED"
-        # findings emitted by Sentinel. Low volume (≤5 messages per
-        # surface_kind over the entire pre-promotion lifetime) but high
-        # signal — keep them out of the noisy general feed.
-        if (
-            event.get("type") == "lease_plane_phase_b_transition"
-            and self.lease_plane_phase_b_channel is not None
-        ):
-            try:
-                self._send_queue.put_nowait(
-                    (self.lease_plane_phase_b_channel, embed, event)
-                )
-            except asyncio.QueueFull:
-                await self._record_receipt(
-                    "bridge.delivery_failed",
-                    source_event=event,
-                    channel=self.lease_plane_phase_b_channel,
-                    reason="send_queue_full",
-                )
 
     def _receipt_payload(
         self,

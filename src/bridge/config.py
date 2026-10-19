@@ -177,7 +177,8 @@ AGENT_TAGS_FAILURE_TTL_SECONDS = float(
 # this set goes to #alerts (it needs the operator) unless its class is one of
 # the explicit noisy pattern-hit classes in embeds._FINDING_ALERT_EXCLUSIONS
 # (Watcher pattern hits, Sentinel held-by-other lease conflicts, deploy-drift
-# "merged commits not pulled" lag); every other finding goes to its resident
+# "merged commits not pulled" lag) or a lease-plane Phase B transition, which
+# has its own channel; every other finding goes to its resident
 # channel only. `high` is included because it is the top severity several
 # genuine alarms use (Sentinel verdict_shift / coordinated degradation /
 # forced release). Before 2026-10 high/critical findings were posted to both
@@ -245,7 +246,7 @@ SYNC_CHANNEL_TOPICS = os.environ.get(
 
 # Per-class routing — when enabled, broadcaster events that map to a
 # violation class (via /v1/taxonomy reverse-lookup) are mirrored to a
-# class-specific text channel in addition to the main #events channel.
+# class-specific text channel in addition to their #activity/#signals post.
 # Lets operators subscribe to specific violation classes and mute the rest.
 # Disabled by default so existing deployments don't get new channels without
 # opt-in.
@@ -254,10 +255,13 @@ CLASS_ROUTING_ENABLED = os.environ.get(
 ).lower() in ("1", "true", "yes", "on")
 
 # Operator-managed channel for lease-plane Phase B promotion-eligibility
-# transitions (event_type=lease_plane_phase_b_transition emitted by Sentinel).
-# Empty/0 disables routing — events still flow to the default activity/signals
-# channels via the standard dispatch path. Channel must already exist; the
-# bridge does NOT auto-create it.
+# transitions emitted by Sentinel (embeds.PHASE_B_TYPES: the
+# lease_plane_phase_b_finding name governance accepts, and the older
+# lease_plane_phase_b_transition). Looked up by id, so the operator may name
+# and rename it freely. When set it is their one destination (WebSocket path);
+# empty/0 sends them to the default signals / resident-findings channels via
+# the standard dispatch path. Channel must already exist; the bridge does NOT
+# create, rename or delete it.
 LEASE_PLANE_PHASE_B_CHANNEL_ID = int(
     os.environ.get("DISCORD_LEASE_PLANE_PHASE_B_CHANNEL_ID", "0") or "0"
 )

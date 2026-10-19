@@ -258,6 +258,15 @@ async def test_fetch_agents_requests_recent_window():
     assert args.get("action") == "list"
     assert args.get("recent_days") == 7
     assert args.get("lite") is True
+    assert gov.call_tool.call_args.kwargs.get("track_failures") is True
+
+
+@pytest.mark.asyncio
+async def test_fetch_agents_passes_track_failures_through():
+    gov = AsyncMock()
+    gov.call_tool = AsyncMock(return_value=None)
+    await _fetch_agents(gov, track_failures=False)
+    assert gov.call_tool.call_args.kwargs.get("track_failures") is False
 
 
 @pytest.mark.asyncio

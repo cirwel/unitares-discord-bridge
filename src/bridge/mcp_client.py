@@ -422,6 +422,7 @@ def _derive_verdict(data: dict) -> str:
 
 async def fetch_agents(
     gov_client: "GovernanceClient", *, with_metrics: bool = False,
+    track_failures: bool = True,
 ) -> list[dict]:
     """Call agent(action="list") and return normalised list of {"id": ..., "label": ...}.
 
@@ -439,6 +440,9 @@ async def fetch_agents(
     bridge's governance load. Agents with a loaded monitor still get their
     own call (see ``fetch_metrics``). Callers that only need labels keep the
     cheaper lite listing.
+
+    ``track_failures`` is passed to :meth:`GovernanceClient.call_tool`; set it
+    to ``False`` for cosmetic reads that must not move the unreachable alert.
     """
     if with_metrics:
         arguments = {
@@ -447,7 +451,9 @@ async def fetch_agents(
         }
     else:
         arguments = {"action": "list", "lite": True, "limit": 50, "recent_days": 7}
-    result = await gov_client.call_tool("agent", arguments)
+    result = await gov_client.call_tool(
+        "agent", arguments, track_failures=track_failures,
+    )
     if result is None:
         return []
     try:

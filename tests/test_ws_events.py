@@ -196,6 +196,133 @@ def test_identity_assurance_change_blue():
 
 
 # ---------------------------------------------------------------------------
+# #alerts lifecycle posts name the agent and the duration (governance payloads
+# from src/background_tasks.py: label + minutes, no reason)
+# ---------------------------------------------------------------------------
+
+_UUID = "0b8e7f52-3c1d-4f7a-9a65-1d2e3f4a5b6c"
+
+
+def _field(embed, name):
+    return next((f.value for f in embed.fields if f.name == name), None)
+
+
+def test_silent_critical_names_agent_and_duration():
+    embed = broadcaster_event_to_embed({
+        "type": "lifecycle_silent_critical",
+        "agent_id": _UUID,
+        "timestamp": "2026-10-19T10:02:00+00:00",
+        "silence_duration_minutes": 95.4,
+        "expected_interval_minutes": 30,
+        "label": "Vigil",
+    })
+    assert _field(embed, "Agent") == f"Vigil ({_UUID[:12]})"
+    assert embed.description == "Silent 95m (expected every 30m)"
+    assert embed.colour == discord.Colour.red()
+    # The title already says "silent critical"; no Type field repeating it.
+    assert _field(embed, "Type") is None
+    assert _field(embed, "Severity") == "critical"
+    # Time in the embed timestamp; the footer is the stable type, not ISO text.
+    assert embed.timestamp.isoformat() == "2026-10-19T10:02:00+00:00"
+    assert embed.footer.text == "lifecycle_silent_critical"
+
+
+def test_silent_durations_read_in_hours_and_days():
+    long_silence = broadcaster_event_to_embed({
+        "type": "lifecycle_silent", "label": "Chronicler",
+        "silence_duration_minutes": 2950.0, "expected_interval_minutes": 1440,
+        "proxy_alive": True,
+    })
+    assert long_silence.description == (
+        "Silent 2.0d (expected every 24.0h); host proxy is alive"
+    )
+    assert long_silence.colour == discord.Colour.orange()
+
+
+def test_resident_paused_names_agent_duration_and_note():
+    embed = broadcaster_event_to_embed({
+        "type": "lifecycle_resident_paused",
+        "agent_id": _UUID,
+        "severity": "critical",
+        "label": "Sentinel",
+        "paused_minutes": 42.6,
+        "note": "Configured resident is paused and dark to governance. "
+                "Operator action: review and resume.",
+    })
+    assert _field(embed, "Agent") == f"Sentinel ({_UUID[:12]})"
+    assert embed.description.startswith("Paused 43m: Configured resident is paused")
+    assert embed.colour == discord.Colour.red()
+    assert _field(embed, "Type") is None
+
+
+def test_resident_paused_without_duration():
+    embed = broadcaster_event_to_embed({
+        "type": "lifecycle_resident_paused", "label": "Sentinel",
+        "paused_minutes": None,
+    })
+    assert embed.description == "Paused (duration unknown)"
+
+
+def test_other_lifecycle_phases_fall_back_to_reason():
+    embed = broadcaster_event_to_embed({
+        "type": "lifecycle_paused", "label": "vigil", "reason": "risk 0.71",
+    })
+    assert embed.description == "risk 0.71"
+
+
+def test_identity_assurance_change_drops_repeated_type_field():
+    embed = broadcaster_event_to_embed({
+        "type": "identity_assurance_change", "agent_id": _UUID,
+        "old_tier": 1, "new_tier": 2,
+    })
+    assert embed.title == "Identity: assurance change"
+    assert embed.description == "Tier 1 -> 2"
+    assert _field(embed, "Agent") == _UUID[:12]
+    assert _field(embed, "Type") is None
+
+
+def test_type_field_kept_when_title_does_not_say_it():
+    embed = broadcaster_event_to_embed({
+        "type": "lease_plane_phase_b_transition", "surface_kind": "file",
+        "promotable_now": False, "promotable_before": False,
+    })
+    assert _field(embed, "Type") == "lease_plane_phase_b_transition"
+
+
+class _FakeLabels:
+    def __init__(self, labels):
+        self.labels = labels
+        self.lookups = []
+
+    async def label_for(self, agent_id):
+        self.lookups.append(agent_id)
+        return self.labels.get(agent_id)
+
+    async def close(self):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_dispatch_names_unlabelled_subject_from_label_cache():
+    sub = _subscriber_with_resident_channels()
+    sub.label_cache = _FakeLabels({_UUID: "Watcher"})
+    await sub._dispatch({"type": "lifecycle_paused", "agent_id": _UUID})
+    _ch, embed, _src = sub._send_queue.get_nowait()
+    assert _field(embed, "Agent") == f"Watcher ({_UUID[:12]})"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_skips_label_lookup_when_event_names_subject():
+    sub = _subscriber_with_resident_channels()
+    sub.label_cache = _FakeLabels({_UUID: "Other"})
+    await sub._dispatch({
+        "type": "lifecycle_silent_critical", "agent_id": _UUID, "label": "Vigil",
+        "silence_duration_minutes": 61, "expected_interval_minutes": 30,
+    })
+    assert sub.label_cache.lookups == []
+
+
+# ---------------------------------------------------------------------------
 # Knowledge events
 # ---------------------------------------------------------------------------
 
@@ -495,6 +622,70 @@ def test_phase_b_first_observation_baseline_renders_neutral():
     assert embed is not None
     assert "criterion change" in embed.title.lower()
     assert embed.colour == discord.Colour.blurple()
+
+
+@pytest.mark.parametrize("phase_b_type", [
+    "lease_plane_phase_b_transition", "lease_plane_phase_b_finding",
+])
+def test_phase_b_embed_path_renders_both_type_names(phase_b_type):
+    from bridge.embeds import event_to_embed
+
+    event = {
+        "type": phase_b_type, "severity": "high", "agent_name": "Sentinel",
+        "surface_kind": "dialectic", "promotable_now": True, "promotable_before": False,
+        "message": "[lease-plane] dialectic: PROMOTABLE", "fingerprint": "0123456789abcdef",
+    }
+    for embed in (broadcaster_event_to_embed(event), event_to_embed(event)):
+        assert embed.title == "Phase B PROMOTABLE: dialectic"
+        assert embed.colour == discord.Colour.green()
+
+
+def _phase_b_subscriber():
+    sub = _subscriber_with_resident_channels("sentinel")
+    sub.residents_channel = MagicMock(spec=discord.TextChannel)
+    sub.residents_channel.name = "residents"
+    sub.lease_plane_phase_b_channel = MagicMock(spec=discord.TextChannel)
+    sub.lease_plane_phase_b_channel.name = "lease-plane-phase-b"
+    return sub
+
+
+@pytest.mark.asyncio
+async def test_phase_b_transition_posts_once_to_phase_b_channel():
+    hit = await _dispatch_and_collect(_phase_b_subscriber(), {
+        "type": "lease_plane_phase_b_transition", "surface_kind": "file",
+        "promotable_now": False, "promotable_before": False,
+    })
+    assert hit == ["lease-plane-phase-b"]
+
+
+@pytest.mark.asyncio
+async def test_phase_b_takes_the_ordinary_route_without_its_channel():
+    sub = _phase_b_subscriber()
+    sub.lease_plane_phase_b_channel = None
+    event = {
+        "type": "lease_plane_phase_b_finding", "severity": "high",
+        "agent_name": "Sentinel", "surface_kind": "dialectic",
+        "promotable_now": True, "promotable_before": False,
+    }
+    assert await _dispatch_and_collect(sub, event) == ["residents"]
+
+
+@pytest.mark.asyncio
+async def test_phase_b_finding_posts_once_to_phase_b_channel_and_never_pages():
+    # A PROMOTABLE flip is posted at "high"; the generic finding rule would
+    # send it to #alerts. It is read in its own channel instead.
+    event = {
+        "type": "lease_plane_phase_b_finding", "severity": "high",
+        "agent_name": "Sentinel", "surface_kind": "dialectic",
+        "promotable_now": True, "promotable_before": False,
+    }
+    hit = await _dispatch_and_collect(_phase_b_subscriber(), event)
+    assert "alerts" not in hit
+    assert hit == ["lease-plane-phase-b"]
+    assert not is_critical_broadcaster_event(event)
+
+    from bridge.embeds import is_critical_event
+    assert not is_critical_event(event)  # the REST poller's rule agrees
 
 
 def test_phase_b_classified_as_signals():
