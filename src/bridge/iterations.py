@@ -18,12 +18,16 @@ import discord
 from bridge import config
 from bridge.cache import BridgeCache
 from bridge.delivery import TRANSIENT_SEND_ERRORS, send_with_retry
-from bridge.mcp_client import AnimaClient, GovernanceClient
+from bridge.mcp_client import (
+    ATTENTION_NO_RESPONSE,
+    ATTENTION_SCHEMA,  # noqa: F401  re-exported: callers import it from here
+    AnimaClient,
+    GovernanceClient,
+)
 from bridge.tasks import cancel_tasks, create_logged_task
 
 log = logging.getLogger(__name__)
 
-ATTENTION_SCHEMA = "anima.self_iteration.attention.v1"
 SEEN_CACHE_KEY = "lumen_self_iteration_seen_v1"
 # The open outage notice: {"channel_id", "message_id", "since", "reason"}, or
 # empty once it is closed. Persisted so a restart mid-outage still closes it.
@@ -329,28 +333,15 @@ class LumenIterationPoller:
             # This process still closes the outage; only a restart would lose it.
             log.warning("Could not persist self-iteration outage state: %s", exc)
 
-    @staticmethod
-    def _failure_reason(projection: object) -> str | None:
-        """Why a projection is unusable, or None when it is usable."""
-        if projection is None:
-            return "no response from Anima"
-        if not isinstance(projection, dict):
-            return f"unexpected response type {type(projection).__name__}"
-        schema = projection.get("schema")
-        if schema != ATTENTION_SCHEMA:
-            return f"schema mismatch (got {_text(schema, limit=80)})"
-        if (
-            projection.get("acknowledgement_is_approval") is not False
-            or projection.get("authority_granted") is not False
-        ):
-            return "authority flags not False"
-        return None
-
     async def _announce_unavailable(self, reason: str) -> None:
         if self.alerts_channel is None or self._unavailable_announced:
             return
-        if reason == "no response from Anima":
+        # Only a transport failure is "no response"; an error reply or a
+        # rejected projection means Anima did answer.
+        if reason.startswith(ATTENTION_NO_RESPONSE):
             summary = "The Discord bridge got no response from Anima's attention projection"
+        elif reason.startswith(("HTTP ", "Anima reported failure")):
+            summary = "Anima answered the attention read with an error"
         else:
             summary = "The Discord bridge rejected Anima's attention projection"
         embed = discord.Embed(
@@ -437,9 +428,9 @@ class LumenIterationPoller:
     async def _tick(self) -> None:
         await self._load_seen()
         await self._load_outage()
-        projection = await self.anima.fetch_self_iteration_attention(limit=50)
-        reason = self._failure_reason(projection)
-        if reason is not None:
+        projection, reason = await self.anima.read_self_iteration_attention(limit=50)
+        if projection is None:
+            reason = reason or ATTENTION_NO_RESPONSE
             self._consecutive_failures += 1
             # Once per outage at WARNING; the client already logs each failed
             # fetch, so repeating this every poll would only add noise.

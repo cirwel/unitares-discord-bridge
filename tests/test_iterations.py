@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import discord
+import httpx
 import pytest
 
 from bridge.iterations import (
@@ -17,6 +18,7 @@ from bridge.iterations import (
     build_iteration_embed,
     normalize_attention_item,
 )
+from bridge.mcp_client import AnimaClient
 
 
 def attention_item(**overrides) -> dict:
@@ -74,18 +76,27 @@ class FakeChannel:
         return message
 
 
+def _read(projection: dict | None) -> tuple[dict | None, str | None]:
+    """What AnimaClient.read_self_iteration_attention returns for a projection."""
+    if projection is None:
+        return None, "no response from Anima (ConnectError)"
+    return projection, None
+
+
 def make_poller(
     projection: dict | None,
     *,
     cached: str | None = None,
     kv: dict[str, str] | None = None,
+    anima: object | None = None,
 ):
     if projection is not None:
         projection.setdefault("acknowledgement_is_approval", False)
         projection.setdefault("authority_granted", False)
-    anima = SimpleNamespace(
-        fetch_self_iteration_attention=AsyncMock(return_value=projection)
-    )
+    if anima is None:
+        anima = SimpleNamespace(
+            read_self_iteration_attention=AsyncMock(return_value=_read(projection))
+        )
     governance = SimpleNamespace(record_bridge_event=AsyncMock(return_value=True))
     store: dict[str, str] = dict(kv or {})
     if cached is not None:
@@ -214,12 +225,14 @@ async def test_projection_outage_is_debounced_and_recovery_announced():
     await poller._tick()
     assert len(alerts.embeds) == 1
 
-    anima.fetch_self_iteration_attention.return_value = {
-        "schema": ATTENTION_SCHEMA,
-        "items": [],
-        "acknowledgement_is_approval": False,
-        "authority_granted": False,
-    }
+    anima.read_self_iteration_attention.return_value = _read(
+        {
+            "schema": ATTENTION_SCHEMA,
+            "items": [],
+            "acknowledgement_is_approval": False,
+            "authority_granted": False,
+        }
+    )
     await poller._tick()
 
     # Closed where it opened: #alerts, replying to the outage notice.
@@ -241,31 +254,92 @@ def _usable_projection() -> dict:
     }
 
 
+def _real_anima(handler) -> AnimaClient:
+    """An AnimaClient whose HTTP traffic goes to ``handler``, not the network."""
+    client = AnimaClient("http://anima.test")
+    client._client = httpx.AsyncClient(
+        base_url="http://anima.test", transport=httpx.MockTransport(handler)
+    )
+    return client
+
+
+async def _outage_notice(handler) -> discord.Embed:
+    """Drive the real client through two failing polls; return the #alerts notice."""
+    anima = _real_anima(handler)
+    try:
+        poller, _a, _g, _c, _i, _s, alerts = make_poller(None, anima=anima)
+        await poller._tick()
+        await poller._tick()
+    finally:
+        await anima.close()
+    assert len(alerts.embeds) == 1
+    return alerts.embeds[0]
+
+
+def _cause(embed: discord.Embed) -> str:
+    return next(f for f in embed.fields if f.name == "Cause").value
+
+
+def _tool_reply(result: dict, *, success: bool = True):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": success, "result": result})
+
+    return handler
+
+
 @pytest.mark.asyncio
 async def test_outage_notice_names_the_failure_cause():
-    poller, anima, _g, _c, _i, _s, alerts = make_poller(None)
-    await poller._tick()
-    await poller._tick()
-    cause = next(f for f in alerts.embeds[0].fields if f.name == "Cause")
-    assert cause.value == "no response from Anima"
+    """The Cause comes from the real client, so each case can actually happen."""
 
-    poller, anima, _g, _c, _i, _s, alerts = make_poller(
-        {"schema": "anima.self_iteration.attention.v2", "items": []}
-    )
-    await poller._tick()
-    await poller._tick()
-    cause = next(f for f in alerts.embeds[0].fields if f.name == "Cause")
-    assert "schema mismatch" in cause.value
-    assert "attention.v2" in cause.value
-    assert "unreachable" not in alerts.embeds[0].description.lower()
+    def refused(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
 
-    poller, anima, _g, _c, _i, _s, alerts = make_poller(
-        {"schema": ATTENTION_SCHEMA, "items": [], "authority_granted": True}
+    embed = await _outage_notice(refused)
+    assert _cause(embed) == "no response from Anima (ConnectError)"
+    assert "no response" in embed.description
+
+    def timed_out(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    embed = await _outage_notice(timed_out)
+    assert _cause(embed) == "no response from Anima (ReadTimeout)"
+
+    embed = await _outage_notice(lambda request: httpx.Response(503, text="busy"))
+    assert _cause(embed) == "HTTP 503 from Anima"
+    assert "no response" not in embed.description
+    assert "error" in embed.description
+
+    embed = await _outage_notice(
+        lambda request: httpx.Response(
+            200, json={"success": False, "error": "unknown action"}
+        )
     )
-    await poller._tick()
-    await poller._tick()
-    cause = next(f for f in alerts.embeds[0].fields if f.name == "Cause")
-    assert cause.value == "authority flags not False"
+    assert _cause(embed) == "Anima reported failure: unknown action"
+    assert "no response" not in embed.description
+
+    embed = await _outage_notice(
+        _tool_reply({"schema": "anima.self_iteration.attention.v2", "items": []})
+    )
+    assert "schema mismatch" in _cause(embed)
+    assert "attention.v2" in _cause(embed)
+    assert "no response" not in embed.description
+    assert "rejected" in embed.description
+
+    # The security-relevant case: Anima claims the projection grants authority.
+    embed = await _outage_notice(
+        _tool_reply(
+            {
+                "schema": ATTENTION_SCHEMA,
+                "items": [],
+                "acknowledgement_is_approval": False,
+                "authority_granted": True,
+            }
+        )
+    )
+    assert _cause(embed).startswith("authority flags not False")
+    assert "authority_granted=True" in _cause(embed)
+    assert "no response" not in embed.description
+    assert "rejected" in embed.description
 
 
 @pytest.mark.asyncio
@@ -277,9 +351,9 @@ async def test_outage_notice_id_is_persisted_and_cleared_on_recovery():
     stored = json.loads(cache.store[OUTAGE_CACHE_KEY])
     assert stored["channel_id"] == alerts.id
     assert stored["message_id"] == alerts.messages[0].id
-    assert stored["reason"] == "no response from Anima"
+    assert stored["reason"] == "no response from Anima (ConnectError)"
 
-    anima.fetch_self_iteration_attention.return_value = _usable_projection()
+    anima.read_self_iteration_attention.return_value = _read(_usable_projection())
     await poller._tick()
     assert cache.store[OUTAGE_CACHE_KEY] == ""
 
