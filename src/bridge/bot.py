@@ -46,10 +46,23 @@ class BridgeBot(commands.Bot):
             await shutdown_bridge()
         await super().close()
 
+    async def on_command_error(self, context, exception) -> None:
+        # Text that merely looks like a command (another bot's prefix, a typo)
+        # is not ours to answer. discord.py's default handler logs a full
+        # traceback for every one of them, which buried real errors in noise.
+        if isinstance(exception, commands.CommandNotFound):
+            log.debug("Ignoring text command the bridge does not own: %s", exception)
+            return
+        await super().on_command_error(context, exception)
+
 
 intents = discord.Intents.default()
 intents.message_content = True
-bot = BridgeBot(command_prefix="!", intents=intents)
+# Every operator command is a slash command (bridge/commands.py); the bridge
+# registers no text commands. A "!" prefix only made it parse other bots'
+# traffic: dispatch_beam's "!d ..." messages each raised CommandNotFound "d".
+# Answer an explicit @mention only, so shared prefixes never reach this bot.
+bot = BridgeBot(command_prefix=commands.when_mentioned, intents=intents)
 
 gov_client = GovernanceClient(
     GOVERNANCE_URL,
