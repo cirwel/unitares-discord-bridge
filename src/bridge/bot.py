@@ -18,6 +18,7 @@ from bridge.config import (
     AGENT_TAGS_TTL_SECONDS, AGENT_TAGS_NONRESIDENT_TTL_SECONDS,
     AGENT_TAGS_FAILURE_TTL_SECONDS, RESIDENT_AGENT_TAGS, EMBODIED_STATE_CHANNEL,
 )
+from bridge.agent_labels import AgentLabelCache
 from bridge.agent_tags import AgentTagResolver
 from bridge.cache import BridgeCache, FindingDeliveryCache
 from bridge.mcp_client import GovernanceClient, AnimaClient
@@ -234,6 +235,7 @@ async def on_ready():
             resident_channels=resident_channels,
             residents_channel=residents_ch,
             delivery_cache=delivery_cache,
+            label_cache=AgentLabelCache(gov_client),
         )
         await ws_subscriber.start()
         log.info(

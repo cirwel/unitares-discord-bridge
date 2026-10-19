@@ -33,6 +33,7 @@ import websockets
 import websockets.exceptions
 
 from bridge import config
+from bridge.agent_labels import AgentLabelCache
 from bridge.cache import FindingDeliveryCache
 from bridge.delivery import DiscordSender
 from bridge.embeds import (
@@ -104,6 +105,67 @@ def ws_url_from_http(http_url: str) -> str:
     return u + "/ws/eisv"
 
 
+# Keys that name an event's subject. ``label`` is what governance's lifecycle
+# broadcasts (lifecycle_silent*, lifecycle_resident_paused) carry.
+_AGENT_NAME_KEYS = (
+    "resident_name",
+    "resident_label",
+    "agent_label",
+    "agent_name",
+    "label",
+)
+
+
+def _event_agent_name(event: dict) -> Optional[str]:
+    for key in _AGENT_NAME_KEYS:
+        value = event.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _format_minutes(value: object) -> str:
+    """``95m`` / ``3.5h`` / ``2.1d`` for a minute count; ``str()`` otherwise."""
+    try:
+        minutes = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return str(value)
+    if minutes < 120:
+        return f"{minutes:.0f}m"
+    if minutes < 2880:
+        return f"{minutes / 60:.1f}h"
+    return f"{minutes / 1440:.1f}d"
+
+
+def _lifecycle_description(phase: str, event: dict) -> str:
+    """Say how long and why, instead of an empty ``reason``."""
+    if phase in ("silent", "silent_critical"):
+        silence = event.get("silence_duration_minutes")
+        if silence is not None:
+            text = f"Silent {_format_minutes(silence)}"
+            expected = event.get("expected_interval_minutes")
+            if expected:
+                text += f" (expected every {_format_minutes(expected)})"
+            if event.get("proxy_alive"):
+                text += "; host proxy is alive"
+            return text
+    elif phase == "resident_paused":
+        paused = event.get("paused_minutes")
+        text = f"Paused {_format_minutes(paused)}" if paused is not None else "Paused (duration unknown)"
+        note = event.get("note")
+        return f"{text}: {note}" if note else text
+    return event.get("reason") or ""
+
+
+def _normalised(text: str) -> str:
+    return "".join(ch for ch in text.lower() if ch.isalnum())
+
+
+def _title_repeats_type(title: str, event_type: str) -> bool:
+    """True when the title already says what the raw event type says."""
+    return _normalised(event_type) in _normalised(title)
+
+
 def _colour_for_tags(tags: list[str]) -> discord.Colour:
     lower = {str(t).lower() for t in tags}
     if "critical" in lower:
@@ -132,12 +194,7 @@ def broadcaster_event_to_embed(event: dict) -> Optional[discord.Embed]:
 
     agent_id = event.get("resident_id") or event.get("agent_id") or ""
     short_id = str(agent_id)[:12] if agent_id else ""
-    agent_name = (
-        event.get("resident_name")
-        or event.get("resident_label")
-        or event.get("agent_label")
-        or event.get("agent_name")
-    )
+    agent_name = _event_agent_name(event)
     if agent_name and short_id and str(agent_name) not in (str(agent_id), short_id):
         agent = f"{agent_name} ({short_id})"
     elif agent_name:
@@ -153,10 +210,10 @@ def broadcaster_event_to_embed(event: dict) -> Optional[discord.Embed]:
     if t.startswith("lifecycle_"):
         phase = t[len("lifecycle_"):]
         title = f"Lifecycle: {phase.replace('_', ' ')}"
-        description = event.get("reason") or ""
-        if phase in ("paused", "stuck_detected", "silent_critical"):
+        description = _lifecycle_description(phase, event)
+        if phase in ("paused", "stuck_detected", "silent_critical", "resident_paused"):
             colour = discord.Colour.red()
-        elif phase == "loop_detected":
+        elif phase in ("loop_detected", "silent"):
             colour = discord.Colour.orange()
         elif phase == "resumed":
             colour = discord.Colour.green()
@@ -217,7 +274,8 @@ def broadcaster_event_to_embed(event: dict) -> Optional[discord.Embed]:
 
     embed = discord.Embed(title=title, description=description, colour=colour)
     embed.add_field(name="Agent", value=str(agent), inline=True)
-    embed.add_field(name="Type", value=t, inline=True)
+    if not _title_repeats_type(title, t):
+        embed.add_field(name="Type", value=t, inline=True)
     if is_critical_broadcaster_event(event):
         embed.add_field(name="Severity", value=attention_severity(event, critical=True), inline=True)
     if t == "lifecycle_silent_critical":
@@ -324,9 +382,13 @@ class WSEventSubscriber:
         resident_channels: Optional[dict[str, discord.TextChannel]] = None,
         residents_channel: Optional[discord.TextChannel] = None,
         delivery_cache: FindingDeliveryCache | None = None,
+        label_cache: AgentLabelCache | None = None,
     ) -> None:
         self.ws_url = ws_url_from_http(governance_url)
         self.gov = gov_client
+        # Names a subject that arrives with only an agent_id; None leaves the
+        # UUID fragment.
+        self.label_cache = label_cache
         self.delivery_cache = delivery_cache
         self.residents_channel = residents_channel
         self.activity_channel = activity_channel
@@ -427,6 +489,18 @@ class WSEventSubscriber:
     async def stop(self) -> None:
         self._stop_event.set()
         await cancel_tasks(self._sub_task, self._send_task)
+        if self.label_cache is not None:
+            await self.label_cache.close()
+
+    async def _with_agent_label(self, event: dict) -> dict:
+        """Add ``agent_label`` from the label cache when the event names no one."""
+        if self.label_cache is None or _event_agent_name(event):
+            return event
+        agent_id = event.get("resident_id") or event.get("agent_id")
+        if not agent_id:
+            return event
+        label = await self.label_cache.label_for(agent_id)
+        return {**event, "agent_label": label} if label else event
 
     async def _subscribe_loop(self) -> None:
         delay = self.reconnect_initial
@@ -514,7 +588,9 @@ class WSEventSubscriber:
                 reason="repeat_drift",
             )
             return
-        embed = broadcaster_event_to_embed(event)
+        if not event.get("type") or event.get("type") == "eisv_update":
+            return
+        embed = broadcaster_event_to_embed(await self._with_agent_label(event))
         if embed is None:
             return
         bucket = classify_broadcaster_event(event)
