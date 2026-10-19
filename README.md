@@ -74,6 +74,15 @@ channel of their own in the `GOVERNANCE` category, created on startup; every
 other resident's findings keep landing in the shared `#residents` feed. Set the
 variable to an empty string to put everyone back on `#residents`.
 
+Each finding is posted once, to one channel: its resident channel, or
+`#alerts` instead when its severity is in `BRIDGE_FINDING_ALERT_SEVERITIES`
+(default `high,critical`) and it is not one of the listed noisy pattern-hit
+classes. Dismissed resolution findings are receipted, not posted. New-agent
+and non-critical risk-threshold events are not posted for agents governance
+tags `ephemeral` (see [docs/alert-attention.md](docs/alert-attention.md)), and
+Lumen's drift-oscillation / trajectory-adjustment chatter goes to
+`#lumen-sensors` instead of `#signals`.
+
 Channel topics are declared in code and reconciled on every startup, so a
 channel whose job changes stops advertising the old one. Set
 `BRIDGE_SYNC_CHANNEL_TOPICS=false` to keep hand-edited topics instead. The bot

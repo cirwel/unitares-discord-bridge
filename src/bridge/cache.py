@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import time
 from collections import OrderedDict
 
 import aiosqlite
@@ -16,14 +17,44 @@ log = logging.getLogger(__name__)
 class FindingDeliveryCache:
     """Coalesce exact REST/WS copies after confirmed delivery, per channel.
 
-    Bounded and process-local, not incident suppression. Distinct findings and
-    critical mirrors still deliver; failures leave the other sender free to try.
+    Findings reach the bridge twice by design: governance broadcasts each one
+    on the /ws/eisv firehose AND serves it on /api/events, and both senders
+    stay live as fallbacks for each other. This cache is what makes that one
+    post. Not incident suppression: distinct findings still deliver, and a
+    failed send leaves the other sender free to try.
+
+    The in-memory map is bounded. With a ``store`` (the bridge's SQLite
+    cache) confirmed deliveries also survive a restart: the REST cursor is
+    persisted, so after a restart the poller re-reads events the WS path had
+    already posted in the last poll interval, and a process-local map would
+    post them again.
     """
 
-    def __init__(self, max_entries: int = 1000) -> None:
+    def __init__(self, max_entries: int = 1000, store: "BridgeCache | None" = None) -> None:
         self._sent: OrderedDict[str, int] = OrderedDict()
         self._pending: dict[str, asyncio.Future] = {}
         self._max_entries = max_entries
+        self._store = store
+
+    async def _stored(self, key: str) -> int | None:
+        if self._store is None:
+            return None
+        try:
+            return await self._store.get_finding_delivery(key)
+        except Exception as exc:  # noqa: BLE001 - persistence is best-effort
+            log.debug("finding delivery lookup failed: %s", exc)
+            return None
+
+    async def _remember(self, key: str, message_id: int) -> None:
+        self._sent[key] = message_id
+        while len(self._sent) > self._max_entries:
+            self._sent.popitem(last=False)
+        if self._store is None:
+            return
+        try:
+            await self._store.put_finding_delivery(key, message_id)
+        except Exception as exc:  # noqa: BLE001 - persistence is best-effort
+            log.debug("finding delivery record failed: %s", exc)
 
     async def send(self, channel, embed, event: dict | None) -> tuple[int | None, bool]:
         event = event or {}
@@ -52,12 +83,14 @@ class FindingDeliveryCache:
         pending = asyncio.get_running_loop().create_future()
         self._pending[key] = pending
         try:
+            stored = await self._stored(key)
+            if stored is not None:
+                self._sent[key] = stored
+                return stored, True
             message = await channel.send(embed=embed)
             message_id = getattr(message, "id", None)
             if isinstance(message_id, int):
-                self._sent[key] = message_id
-                while len(self._sent) > self._max_entries:
-                    self._sent.popitem(last=False)
+                await self._remember(key, message_id)
             return message_id, False
         finally:
             self._pending.pop(key, None)
@@ -89,8 +122,47 @@ class BridgeCache:
                 key   TEXT PRIMARY KEY,
                 value TEXT
             );
+            CREATE TABLE IF NOT EXISTS finding_deliveries (
+                key          TEXT PRIMARY KEY,
+                message_id   INTEGER NOT NULL,
+                delivered_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_finding_deliveries_at
+                ON finding_deliveries (delivered_at);
             """
         )
+
+    # -- confirmed finding deliveries ---------------------------------------
+
+    # Long enough to cover any REST replay after a restart or governance
+    # outage; short enough that the table stays small (tens of rows a day).
+    FINDING_DELIVERY_RETENTION_SECONDS = 7 * 24 * 3600
+
+    async def get_finding_delivery(self, key: str) -> int | None:
+        """Discord message id a finding identity was already delivered as."""
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT message_id FROM finding_deliveries WHERE key = ?", (key,)
+        ) as cur:
+            row = await cur.fetchone()
+        return int(row[0]) if row else None
+
+    async def put_finding_delivery(self, key: str, message_id: int) -> None:
+        """Record a confirmed delivery and drop rows past retention."""
+        assert self._db is not None
+        now = time.time()
+        await self._db.execute(
+            "INSERT INTO finding_deliveries (key, message_id, delivered_at)"
+            " VALUES (?, ?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET message_id = excluded.message_id,"
+            " delivered_at = excluded.delivered_at",
+            (key, int(message_id), now),
+        )
+        await self._db.execute(
+            "DELETE FROM finding_deliveries WHERE delivered_at < ?",
+            (now - self.FINDING_DELIVERY_RETENTION_SECONDS,),
+        )
+        await self._db.commit()
 
     # -- event cursor --------------------------------------------------------
 

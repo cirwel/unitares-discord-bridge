@@ -13,15 +13,15 @@ log = logging.getLogger(__name__)
 
 CHANNEL_STRUCTURE: dict[str, dict[str, dict[str, str]]] = {
     "GOVERNANCE": {
-        "activity": {"type": "text", "topic": "Routine agent activity — onboards, idle, lifecycle_created/resumed/archived, knowledge writes"},
+        "activity": {"type": "text", "topic": "Routine agent activity — resident onboards, idle, lifecycle_created/resumed/archived, knowledge writes"},
         "signals": {"type": "text", "topic": "Diagnostic feed — drift, risk and governance transitions. Start with #alerts for urgent triage; messages here are not a separate task queue."},
-        "alerts": {"type": "text", "topic": "Start here for urgent triage — pauses, stuck/silent-critical agents, critical findings and human-review requests. ✅ means seen, not resolved or approved."},
-        "residents": {"type": "text", "topic": "Resident diagnostic detail — critical/high findings also reach #alerts. Not a separate task queue; ✅ means seen, not resolved."},
+        "alerts": {"type": "text", "topic": "Start here for urgent triage — pauses, stuck/silent-critical agents, high/critical resident alarms and human-review requests. ✅ means seen, not resolved or approved."},
+        "residents": {"type": "text", "topic": "Resident findings, each posted once here (high/critical alarms go to #alerts instead). Not a separate task queue; ✅ means seen, not resolved."},
         "governance-hud": {"type": "text", "topic": "Auto-updating system status"},
     },
     "LUMEN": {
         "lumen-art": {"type": "text", "topic": "Lumen's drawings"},
-        "lumen-sensors": {"type": "text", "topic": "Environmental sensor readings"},
+        "lumen-sensors": {"type": "text", "topic": "Environmental sensor readings, offline/recovery transitions, and Lumen's own governance-state chatter (drift oscillation, trajectory adjustments)"},
         "lumen-iterations": {"type": "text", "topic": "Read-only self-iteration proposals, reviews, canaries, and recovery attention"},
         "lumen-digest": {"type": "text", "topic": "Weekly Q&A digest — what Lumen wondered about, and when to visit live"},
     },
@@ -89,8 +89,8 @@ def _resident_finding_channels(
             continue
         out[key] = {
             "type": "text",
-            "topic": f"{key.replace('-', ' ').title()} findings only — "
-                     "diagnostic detail; critical/high findings also reach #alerts. Not a separate task queue.",
+            "topic": f"{key.replace('-', ' ').title()} findings only, each posted once — "
+                     "high/critical alarms go to #alerts instead. Not a separate task queue.",
         }
     return out
 

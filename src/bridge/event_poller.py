@@ -10,13 +10,15 @@ from datetime import datetime, timezone
 import discord
 
 from bridge import config
+from bridge.agent_tags import AgentTagResolver, has_any, is_positively_nonresident
 from bridge.cache import BridgeCache, FindingDeliveryCache
 from bridge.embeds import (
     attention_severity,
     classify_rest_event,
     event_to_embed,
-    finding_resident_key,
+    finding_destination,
     is_critical_event,
+    is_dismissed_resolution,
     is_finding_event,
 )
 from bridge.mcp_client import GovernanceClient, fetch_agents
@@ -64,8 +66,16 @@ class EventPoller:
         residents_channel: discord.TextChannel | None = None,
         resident_channels: dict[str, discord.TextChannel] | None = None,
         delivery_cache: FindingDeliveryCache | None = None,
+        tag_resolver: AgentTagResolver | None = None,
+        embodied_channel: discord.TextChannel | None = None,
     ) -> None:
         self.gov = gov_client
+        # Reads the subject agent's governance tags for resident-only and
+        # embodied routing. None disables both (every event posts as before).
+        self.tag_resolver = tag_resolver
+        # Lumen-family channel for an embodied agent's state chatter
+        # (config.EMBODIED_STATE_EVENT_TYPES). None keeps it in #signals.
+        self.embodied_channel = embodied_channel
         self.cache = cache
         self.delivery_cache = delivery_cache
         self.activity_channel = activity_channel
@@ -86,18 +96,54 @@ class EventPoller:
         )
 
     def _finding_channel(self, event: dict) -> discord.TextChannel | None:
-        """Channel a finding belongs in, or ``None`` if it isn't a finding.
+        """The one channel a finding is posted to, or ``None`` if it isn't one.
 
-        A resident with its own channel (Sentinel, Doctor) wins; every other
-        resident falls back to the shared #residents feed. ``None`` is also
-        returned when neither exists, so the caller routes by activity/signals
-        as before.
+        #alerts when the finding needs the operator (critical by default);
+        otherwise a resident with its own channel (Sentinel, Doctor) wins and
+        every other resident falls back to the shared #residents feed. ``None``
+        is also returned when neither exists, so the caller routes by
+        activity/signals as before.
         """
-        if not is_finding_event(event):
+        return finding_destination(
+            event,
+            alerts_channel=self.alerts_channel,
+            resident_channels=self.resident_channels,
+            residents_channel=self.residents_channel,
+        )
+
+    async def _subject_tags(self, event: dict) -> frozenset[str] | None:
+        """Governance tags of the event's subject agent, when routing needs them."""
+        if self.tag_resolver is None:
             return None
-        key = finding_resident_key(event)
-        own = self.resident_channels.get(key) if key else None
-        return own or self.residents_channel
+        t = str(event.get("type") or "").lower()
+        if t not in config.RESIDENT_ONLY_EVENT_TYPES and t not in config.EMBODIED_STATE_EVENT_TYPES:
+            return None
+        return await self.tag_resolver.tags(event.get("agent_id"))
+
+    @staticmethod
+    def _is_nonresident_subject(event: dict, tags: frozenset[str] | None) -> bool:
+        """A resident-only event type whose subject governance positively marks
+        non-resident (e.g. tagged ``ephemeral``). Unknown, empty or failed
+        lookups are NOT non-resident: they post as before."""
+        t = str(event.get("type") or "").lower()
+        return t in config.RESIDENT_ONLY_EVENT_TYPES and is_positively_nonresident(
+            tags,
+            nonresident_tags=config.NONRESIDENT_AGENT_TAGS,
+            resident_tags=config.RESIDENT_AGENT_TAGS,
+        )
+
+    @classmethod
+    def _suppression_reason(cls, event: dict, tags: frozenset[str] | None) -> str | None:
+        """Why this event is receipted but not posted, or ``None`` to post it.
+
+        A critical event is never suppressed here: a non-resident's critical
+        risk crossing still goes to #alerts (see the routing below).
+        """
+        if config.SUPPRESS_DISMISSED_RESOLUTIONS and is_dismissed_resolution(event):
+            return "dismissed_resolution"
+        if cls._is_nonresident_subject(event, tags) and not is_critical_event(event):
+            return "non_resident_agent"
+        return None
 
     async def start(self) -> None:
         """Spawn the poll and send loops as background tasks."""
@@ -207,9 +253,27 @@ class EventPoller:
                 # — otherwise the next poll fetches the same poisoned batch
                 # and the feed stays silent forever.
                 try:
+                    tags = await self._subject_tags(event)
+                    reason = self._suppression_reason(event, tags)
+                    if reason is not None:
+                        await self._record_receipt(
+                            "bridge.suppressed", source_event=event, reason=reason,
+                        )
+                        continue
                     event_for_embed = _with_resident_label(event, label_by_id)
                     embed = event_to_embed(event_for_embed)
+                    if self._is_nonresident_subject(event, tags):
+                        # Critical (else it was suppressed above): page the
+                        # operator once, skip the routine #signals copy.
+                        await self._message_queue.put((self.alerts_channel, embed, event))
+                        continue
                     target = self._finding_channel(event)
+                    if target is None and (
+                        self.embodied_channel is not None
+                        and str(event.get("type") or "").lower() in config.EMBODIED_STATE_EVENT_TYPES
+                        and has_any(tags, config.EMBODIED_AGENT_TAGS)
+                    ):
+                        target = self.embodied_channel
                     if target is None:
                         bucket = classify_rest_event(event)
                         target = (
@@ -217,7 +281,9 @@ class EventPoller:
                             else self.signals_channel
                         )
                     await self._message_queue.put((target, embed, event))
-                    if is_critical_event(event):
+                    # A finding already went to its one channel (#alerts when
+                    # critical); everything else mirrors critical to #alerts.
+                    if not is_finding_event(event) and is_critical_event(event):
                         await self._message_queue.put((self.alerts_channel, embed, event))
                 except Exception as exc:
                     log.error(

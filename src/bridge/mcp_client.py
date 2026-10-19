@@ -226,8 +226,16 @@ class GovernanceClient:
         )
         return True
 
-    async def call_tool(self, tool_name: str, arguments: dict) -> dict | None:
-        """POST /v1/tools/call with {"name": ..., "arguments": ...}. Returns None on error."""
+    async def call_tool(
+        self, tool_name: str, arguments: dict, *, track_failures: bool = True,
+    ) -> dict | None:
+        """POST /v1/tools/call with {"name": ..., "arguments": ...}. Returns None on error.
+
+        ``track_failures=False`` is for auxiliary reads (agent tag lookups):
+        their outcome neither raises nor clears ``consecutive_failures``, which
+        drives the "Governance MCP Unreachable" alert and must reflect the
+        event feed itself.
+        """
         client = self._get_client()
         if (
             self.client_session_id
@@ -242,9 +250,13 @@ class GovernanceClient:
                 timeout=30,
             )
             resp.raise_for_status()
-            self.consecutive_failures = 0
+            if track_failures:
+                self.consecutive_failures = 0
             return resp.json()
         except Exception as exc:
+            if not track_failures:
+                log.debug("governance call_tool(%s) failed (untracked): %s", tool_name, exc)
+                return None
             self.consecutive_failures += 1
             log.warning("governance call_tool(%s) failed (%d): %s", tool_name, self.consecutive_failures, exc)
             return None

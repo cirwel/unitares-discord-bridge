@@ -15,7 +15,10 @@ from bridge.config import (
     RESIDENT_FINDING_CHANNELS, SYNC_CHANNEL_TOPICS,
     DIGEST_ENABLED, DIGEST_INTERVAL, DIGEST_WINDOW, DIGEST_CHECK_INTERVAL,
     DIGEST_RELATIONAL_THRESHOLD, LUMEN_OFFLINE_MENTION,
+    AGENT_TAGS_TTL_SECONDS, AGENT_TAGS_NONRESIDENT_TTL_SECONDS,
+    AGENT_TAGS_FAILURE_TTL_SECONDS, RESIDENT_AGENT_TAGS, EMBODIED_STATE_CHANNEL,
 )
+from bridge.agent_tags import AgentTagResolver
 from bridge.cache import BridgeCache, FindingDeliveryCache
 from bridge.mcp_client import GovernanceClient, AnimaClient
 from bridge.server_setup import ensure_server_structure
@@ -154,7 +157,13 @@ async def on_ready():
     }
 
     if activity_ch and signals_ch and alerts_ch:
-        delivery_cache = FindingDeliveryCache()
+        # Persisted so a restart cannot re-post findings the WS path already
+        # delivered (the REST cursor survives restarts; a memory map does not).
+        delivery_cache = FindingDeliveryCache(store=cache)
+        # Lumen-family destination for an embodied agent's state chatter.
+        embodied_ch = channels.get(EMBODIED_STATE_CHANNEL) if EMBODIED_STATE_CHANNEL else None
+        if not isinstance(embodied_ch, discord.TextChannel):
+            embodied_ch = None
         event_poller = EventPoller(
             gov_client, cache, activity_ch, signals_ch, alerts_ch,
             EVENT_POLL_INTERVAL,
@@ -162,11 +171,20 @@ async def on_ready():
             residents_channel=residents_ch,
             resident_channels=resident_channels,
             delivery_cache=delivery_cache,
+            tag_resolver=AgentTagResolver(
+                gov_client,
+                ttl=AGENT_TAGS_TTL_SECONDS,
+                nonresident_ttl=AGENT_TAGS_NONRESIDENT_TTL_SECONDS,
+                failure_ttl=AGENT_TAGS_FAILURE_TTL_SECONDS,
+                resident_tags=RESIDENT_AGENT_TAGS,
+            ),
+            embodied_channel=embodied_ch,
         )
         await event_poller.start()
         log.info(
-            "Event poller started (resident channels: %s)",
+            "Event poller started (resident channels: %s; embodied state: %s)",
             ", ".join(f"#{k}" for k in resident_channels) or "none",
+            f"#{EMBODIED_STATE_CHANNEL}" if embodied_ch else "signals",
         )
 
         # Build the per-class channel map for the WS subscriber. Keys are

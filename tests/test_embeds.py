@@ -110,12 +110,27 @@ def test_watcher_finding_embed():
     assert "Location" in field_names
 
 
-def test_finding_high_severity_routes_to_alerts():
-    # high severity = route to #alerts, not just the main feed
+def test_high_and_critical_findings_route_to_alerts():
+    # Findings post once: high/critical go to #alerts (unless a noisy
+    # pattern-hit class), everything else stays in its resident channel.
     assert is_critical_event({"type": "sentinel_finding", "severity": "high"})
-    assert is_critical_event({"type": "watcher_finding", "severity": "critical"})
+    assert is_critical_event({"type": "vigil_finding", "severity": "critical"})
     assert not is_critical_event({"type": "sentinel_finding", "severity": "info"})
-    assert not is_critical_event({"type": "watcher_finding", "severity": "medium"})
+    assert not is_critical_event({"type": "sentinel_finding", "severity": "medium"})
+
+
+def test_resolution_findings_never_route_to_alerts():
+    assert not is_critical_event(
+        {"type": "watcher_resolution_finding", "severity": "critical", "action": "confirmed"}
+    )
+
+
+def test_finding_alert_severities_are_configurable(monkeypatch):
+    from bridge import config
+
+    monkeypatch.setattr(config, "FINDING_ALERT_SEVERITIES", frozenset({"critical"}))
+    assert not is_critical_event({"type": "sentinel_finding", "severity": "high"})
+    assert is_critical_event({"type": "sentinel_finding", "severity": "critical"})
 
 
 def test_classify_rest_event_activity_types():
