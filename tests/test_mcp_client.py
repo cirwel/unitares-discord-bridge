@@ -761,6 +761,19 @@ async def test_governance_fetch_timeline_returns_payload_and_sends_params():
 
 
 @pytest.mark.asyncio
+async def test_governance_fetch_timeline_http_error_is_none():
+    resp = make_mock_response(status_code=401)
+    resp.raise_for_status.side_effect = Exception("401 Unauthorized")
+
+    with mock_httpx_client("get", resp):
+        client = GovernanceClient("http://localhost:8767")
+        result = await client.fetch_timeline()
+
+    assert result is None
+    assert client.consecutive_failures == 0
+
+
+@pytest.mark.asyncio
 async def test_governance_fetch_timeline_unsuccessful_body_is_none():
     resp = make_mock_response(json_data={"success": False, "error": "query failed"})
 

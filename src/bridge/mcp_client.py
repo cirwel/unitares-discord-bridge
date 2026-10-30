@@ -214,7 +214,7 @@ class GovernanceClient:
                 await client.aclose()
 
     async def fetch_timeline(
-        self, hours: int = 6, kinds: str = "checkin,lifecycle", limit: int = 2000,
+        self, hours: int = 24, kinds: str = "checkin,lifecycle", limit: int = 2000,
     ) -> dict | None:
         """GET /v1/timeline (read-only). Returns the response dict, or None on error.
 
@@ -222,7 +222,11 @@ class GovernanceClient:
         declared ``host_session`` ({harness, session_id, resumable} or null,
         portal hub H0). The roster only names agents with an event in the
         window, so ``kinds`` and ``limit`` decide who appears; ``truncated``
-        in the response says when a kind hit the limit.
+        in the response says when a kind hit the limit. Substrate check-ins
+        stay included and the limit stays high on purpose: hook-recorded
+        check-ins are often a session's only events, and measured 2026-10-30
+        excluding them or a 500 limit both dropped live sessions from the
+        roster. The cost is ~0.3 MB at 24h and under 1 MB at 168h.
 
         An auxiliary read: it never touches ``consecutive_failures``, which
         drives the "Governance MCP Unreachable" alert for the event feed.

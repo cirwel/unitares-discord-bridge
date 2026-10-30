@@ -258,6 +258,22 @@ def build_lumen_embed(state: dict) -> discord.Embed:
 
 
 SESSIONS_MAX_ROWS = 15
+_SESSIONS_LABEL_CHARS = 60
+_EMBED_DESCRIPTION_LIMIT = 4096
+
+
+def _safe_label(text: str, limit: int = _SESSIONS_LABEL_CHARS) -> str:
+    """Agent-set or user-typed text made safe for an embed: capped, markdown escaped."""
+    text = " ".join(str(text).split())
+    if len(text) > limit:
+        text = text[: limit - 1] + "…"
+    return discord.utils.escape_markdown(discord.utils.escape_mentions(text))
+
+
+def _hub_link(url: str) -> str:
+    """The hub URL if it is an absolute http(s) URL Discord will accept, else ''."""
+    url = (url or "").strip()
+    return url if url.startswith(("http://", "https://")) and len(url) <= 512 else ""
 
 
 def _relative_age(iso_ts: str | None, now: datetime) -> str:
@@ -316,6 +332,7 @@ def build_sessions_embed(
         ]
 
     hours = (timeline.get("window") or {}).get("hours")
+    hub_url = _hub_link(hub_url)
     title = "Agent sessions (read-only)"
     embed = discord.Embed(
         title=title,
@@ -327,13 +344,15 @@ def build_sessions_embed(
 
     lines = []
     if not sessions:
-        scope = f" for harness `{want}`" if want else ""
+        scope = f" for harness {_safe_label(want, 32)}" if want else ""
         lines.append(f"No recorded host sessions{scope} in the last {hours or '?'}h.")
     else:
         for a in sessions[:SESSIONS_MAX_ROWS]:
             hs = a["host_session"]
-            label = a.get("label") or (a.get("agent_id") or "?")[:8]
-            short_sid = (hs.get("session_id") or "")[:8]
+            label = _safe_label(a.get("label") or (a.get("agent_id") or "?")[:8])
+            # Inside a code span only a backtick is special.
+            sid = str(hs.get("session_id") or "").removeprefix("session_")
+            short_sid = sid[:8].replace("`", "'")
             resume = (
                 f"resumable `{short_sid}`" if hs.get("resumable")
                 else f"not resumable `{short_sid}`"
@@ -341,16 +360,30 @@ def build_sessions_embed(
             status = a.get("status") or "?"
             age = _relative_age(a.get("last_activity_at"), now)
             lines.append(
-                f"**{label}** · {hs.get('harness') or '?'} · {status} · {resume} · {age}"
+                f"**{label}** · {_safe_label(hs.get('harness') or '?', 32)} · "
+                f"{_safe_label(status, 24)} · {resume} · {age}"
             )
         more = len(sessions) - SESSIONS_MAX_ROWS
         if more > 0:
             lines.append(f"…and {more} more")
     if others and not want:
-        names = ", ".join((a.get("label") or (a.get("agent_id") or "?")[:8]) for a in others[:5])
+        names = ", ".join(
+            _safe_label(a.get("label") or (a.get("agent_id") or "?")[:8], 40)
+            for a in others[:5]
+        )
         extra = f" +{len(others) - 5}" if len(others) > 5 else ""
-        lines.append(f"_{len(others)} other active agent(s) without a recorded session: {names}{extra}_")
-    embed.description = "\n".join(lines)
+        lines.append(f"{len(others)} other agent(s) seen without a recorded session: {names}{extra}")
+    # Keep under Discord's description limit whatever the labels are.
+    kept: list[str] = []
+    used = 0
+    for line in lines:
+        cost = len(line) + (1 if kept else 0)
+        if used + cost > _EMBED_DESCRIPTION_LIMIT - 2:
+            kept.append("…")
+            break
+        kept.append(line)
+        used += cost
+    embed.description = "\n".join(kept)
 
     if hub_url:
         embed.add_field(
@@ -616,7 +649,7 @@ def setup_commands(
             )
             await interaction.followup.send(embed=embed)
         except Exception as exc:
-            log.error("/sessions error: %s", exc)
+            log.error("/sessions error: %s", exc, exc_info=True)
             await interaction.followup.send(
                 embed=_error_embed("Failed to list sessions."),
             )
