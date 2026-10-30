@@ -741,3 +741,54 @@ async def test_untracked_call_tool_success_does_not_clear_failure_counter():
         client.consecutive_failures = 3
         await client.call_tool("agent", {"action": "get"}, track_failures=False)
     assert client.consecutive_failures == 3
+
+
+# --- fetch_timeline (/sessions roster) ---
+
+@pytest.mark.asyncio
+async def test_governance_fetch_timeline_returns_payload_and_sends_params():
+    payload = {"success": True, "window": {"hours": 6}, "agents": [], "events": []}
+    resp = make_mock_response(json_data=payload)
+
+    with mock_httpx_client("get", resp) as mock_cls:
+        client = GovernanceClient("http://localhost:8767")
+        result = await client.fetch_timeline(hours=12)
+        call = mock_cls.return_value.get.call_args
+
+    assert result == payload
+    assert call.args[0] == "/v1/timeline"
+    assert call.kwargs["params"] == {"hours": 12, "kinds": "checkin,lifecycle", "limit": 2000}
+
+
+@pytest.mark.asyncio
+async def test_governance_fetch_timeline_http_error_is_none():
+    resp = make_mock_response(status_code=401)
+    resp.raise_for_status.side_effect = Exception("401 Unauthorized")
+
+    with mock_httpx_client("get", resp):
+        client = GovernanceClient("http://localhost:8767")
+        result = await client.fetch_timeline()
+
+    assert result is None
+    assert client.consecutive_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_governance_fetch_timeline_unsuccessful_body_is_none():
+    resp = make_mock_response(json_data={"success": False, "error": "query failed"})
+
+    with mock_httpx_client("get", resp):
+        client = GovernanceClient("http://localhost:8767")
+        result = await client.fetch_timeline()
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_governance_fetch_timeline_error_does_not_trip_feed_alert():
+    with mock_httpx_client_error("get", Exception("down")):
+        client = GovernanceClient("http://localhost:8767")
+        result = await client.fetch_timeline()
+
+    assert result is None
+    assert client.consecutive_failures == 0

@@ -16,7 +16,7 @@ resident channels carry supporting detail, and acknowledgements are not fixes.
 - **Lumen state** — Sensor readings, creature status from the embodied agent
 - **Lumen self-iteration** — Provenance-labeled proposal/review/canary attention with critical recovery routing
 - **HUD updates** — Live status channels
-- **Slash commands** — Status, health, resume, and Lumen snapshots
+- **Slash commands** — Status, health, sessions, resume, and Lumen snapshots
 
 ## Prerequisites
 
@@ -58,6 +58,14 @@ Each post preserves Anima's epistemic distinction: proposal source labels are
 shown as caller claims, request provenance is not presented as claim truth, and
 independent verification status and effective policy weight are displayed
 separately.
+
+`/sessions` is a read-only roster of recent agent sessions from governance's
+`GET /v1/timeline`: harness, governance status, whether a resumable host
+session is recorded (portal hub H0), and last activity. It starts and resumes
+nothing; set `PORTAL_HUB_URL` to link the portal hub, which owns resume and
+start. "Resumable" means only that the record holds enough to attempt one.
+`/resume` is unrelated to sessions: it releases a governance pause through
+`operator_resume_agent`.
 
 The live HUD and `/status` read the fleet in one call:
 `agent(action="list", include_metrics=true)` returns each agent's EISV with

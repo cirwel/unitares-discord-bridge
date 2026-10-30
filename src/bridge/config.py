@@ -22,6 +22,11 @@ ANIMA_TOKEN = os.environ.get("ANIMA_API_TOKEN", "")
 # degrades loudly rather than silently: see hud.py.
 GOVERNANCE_OPERATOR_TOKEN = os.environ.get("GOVERNANCE_OPERATOR_TOKEN", "")
 
+# Portal hub URL that /sessions links to as the place to resume or start a
+# session (portal hub H3/H4). Empty (the default) omits the link. The bridge
+# itself never starts or resumes vendor sessions: /sessions is read-only.
+PORTAL_HUB_URL = os.environ.get("PORTAL_HUB_URL", "").strip()
+
 # Mention prefixed to the "Lumen Offline" / "Lumen Online" posts ONLY — e.g.
 # "<@123456789>" for a user or "<@&987654321>" for a role. Empty (the default)
 # keeps the current behaviour and the repo user-agnostic.

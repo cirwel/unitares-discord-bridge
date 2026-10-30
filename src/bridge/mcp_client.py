@@ -213,6 +213,43 @@ class GovernanceClient:
             if self._client is None:
                 await client.aclose()
 
+    async def fetch_timeline(
+        self, hours: int = 24, kinds: str = "checkin,lifecycle", limit: int = 2000,
+    ) -> dict | None:
+        """GET /v1/timeline (read-only). Returns the response dict, or None on error.
+
+        Used by /sessions for its ``agents`` roster, which carries each agent's
+        declared ``host_session`` ({harness, session_id, resumable} or null,
+        portal hub H0). The roster only names agents with an event in the
+        window, so ``kinds`` and ``limit`` decide who appears; ``truncated``
+        in the response says when a kind hit the limit. Substrate check-ins
+        stay included and the limit stays high on purpose: hook-recorded
+        check-ins are often a session's only events, and measured 2026-10-30
+        excluding them or a 500 limit both dropped live sessions from the
+        roster. The cost is ~0.3 MB at 24h and under 1 MB at 168h.
+
+        An auxiliary read: it never touches ``consecutive_failures``, which
+        drives the "Governance MCP Unreachable" alert for the event feed.
+        """
+        client = self._get_client()
+        try:
+            resp = await client.get(
+                "/v1/timeline",
+                params={"hours": hours, "kinds": kinds, "limit": limit},
+                timeout=20,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if not isinstance(data, dict) or not data.get("success", False):
+                return None
+            return data
+        except Exception as exc:
+            log.warning("governance fetch_timeline failed: %s", _cause(exc))
+            return None
+        finally:
+            if self._client is None:
+                await client.aclose()
+
     async def record_bridge_event(self, payload: dict) -> bool:
         """POST a Discord delivery/attention receipt to governance.
 

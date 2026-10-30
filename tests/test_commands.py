@@ -508,3 +508,130 @@ def test_recent_events_empty_when_window_zero():
     import time
     time.sleep(0.001)
     assert recent_events(0) == []
+
+
+# ---------------------------------------------------------------------------
+# build_sessions_embed — read-only /sessions roster from GET /v1/timeline
+# ---------------------------------------------------------------------------
+
+from datetime import datetime as _dt, timezone as _tz
+
+from bridge.commands import build_sessions_embed, SESSIONS_MAX_ROWS
+
+_NOW = _dt(2026, 10, 30, 22, 0, tzinfo=_tz.utc)
+
+
+def _agent(aid, label, *, harness=None, sid=None, resumable=False,
+           status="active", last="2026-10-30T21:55:00+00:00"):
+    hs = None
+    if harness:
+        hs = {"harness": harness, "session_id": sid or "abcdef0123456789", "resumable": resumable}
+    return {"agent_id": aid, "label": label, "host_session": hs,
+            "status": status, "last_activity_at": last}
+
+
+def test_sessions_embed_lists_sessions_newest_first_and_summarises_others():
+    timeline = {
+        "window": {"hours": 24},
+        "truncated": [],
+        "agents": [
+            _agent("a1", "old-codex", harness="codex", resumable=False,
+                   last="2026-10-30T19:00:00+00:00"),
+            _agent("a2", "new-claude", harness="claude-code", sid="1234567890abcdef",
+                   resumable=True, last="2026-10-30T21:58:00+00:00"),
+            _agent("a3", "Sentinel"),
+        ],
+    }
+    embed = build_sessions_embed(timeline, now=_NOW)
+    lines = embed.description.splitlines()
+    assert "read-only" in embed.title.lower()
+    assert lines[0].startswith("**new-claude** · claude-code · active · resumable `12345678`")
+    assert "2m ago" in lines[0]
+    assert "not resumable" in lines[1] and "3h ago" in lines[1]
+    assert lines[2] == "1 other agent(s) seen without a recorded session: Sentinel"
+    # Full vendor session ids are not echoed into Discord.
+    assert "1234567890abcdef" not in embed.description
+    assert "governance pause" in embed.footer.text
+
+
+def test_sessions_embed_harness_filter_is_case_insensitive_prefix():
+    timeline = {"window": {"hours": 6}, "agents": [
+        _agent("a1", "c1", harness="claude-code"),
+        _agent("a2", "c2", harness="claude-code-web"),
+        _agent("a3", "x1", harness="codex"),
+        _agent("a4", "none"),
+    ]}
+    embed = build_sessions_embed(timeline, harness="Claude", now=_NOW)
+    assert "c1" in embed.description and "c2" in embed.description
+    assert "x1" not in embed.description and "none" not in embed.description
+
+
+def test_sessions_embed_empty_and_hub_link():
+    embed = build_sessions_embed(
+        {"window": {"hours": 3}, "agents": []},
+        harness="codex", hub_url="http://127.0.0.1:8791", now=_NOW,
+    )
+    assert embed.description == "No recorded host sessions for harness codex in the last 3h."
+    assert embed.url == "http://127.0.0.1:8791"
+    assert any("portal hub" in f.value for f in embed.fields)
+
+
+def test_sessions_embed_no_sessions_still_names_active_agents():
+    agents = [_agent(f"r{i}", f"res{i}") for i in range(7)]
+    embed = build_sessions_embed({"window": {"hours": 6}, "agents": agents}, now=_NOW)
+    lines = embed.description.splitlines()
+    assert lines[0] == "No recorded host sessions in the last 6h."
+    assert "7 other agent(s) seen" in lines[1] and lines[1].endswith("+2")
+
+
+def test_sessions_embed_no_hub_link_by_default_and_reports_truncation():
+    embed = build_sessions_embed(
+        {"window": {"hours": 6}, "truncated": ["checkin"],
+         "agents": [_agent("a", "x", harness="codex")]},
+        now=_NOW,
+    )
+    assert embed.url is None
+    assert not embed.fields
+    assert "truncated: checkin" in embed.footer.text
+
+
+def test_sessions_embed_caps_rows():
+    agents = [_agent(f"a{i}", f"agent{i}", harness="claude-code")
+              for i in range(SESSIONS_MAX_ROWS + 4)]
+    embed = build_sessions_embed({"window": {"hours": 6}, "agents": agents}, now=_NOW)
+    assert embed.description.splitlines()[-1] == "…and 4 more"
+    assert len(embed.description) <= 4096
+
+
+def test_sessions_embed_escapes_and_caps_hostile_labels_within_limit():
+    evil = "**[click](https://evil.example)** @everyone " + "x" * 500
+    agents = [_agent(f"a{i}", evil, harness="claude-code", sid="ab`cdefgh99")
+              for i in range(SESSIONS_MAX_ROWS)]
+    agents += [_agent(f"o{i}", evil) for i in range(10)]
+    embed = build_sessions_embed({"window": {"hours": 6}, "agents": agents}, now=_NOW)
+    desc = embed.description
+    assert len(desc) <= 4096
+    # The masked link is neutralised: every "[" arrives escaped.
+    import re
+    assert not re.search(r"(?<!\\)\[click\]", desc)
+    assert "**[" not in desc
+    assert "@everyone" not in desc
+    assert "x" * 100 not in desc
+    assert "`ab'cdefg`" in desc
+
+
+def test_sessions_embed_drops_malformed_hub_url():
+    embed = build_sessions_embed(
+        {"window": {"hours": 6}, "agents": []}, hub_url="127.0.0.1:8791", now=_NOW,
+    )
+    assert embed.url is None
+    assert not embed.fields
+
+
+def test_sessions_embed_malformed_timestamp_reads_unknown():
+    embed = build_sessions_embed(
+        {"window": {"hours": 6},
+         "agents": [_agent("a", "x", harness="codex", last="not-a-date")]},
+        now=_NOW,
+    )
+    assert embed.description.endswith("· ?")
