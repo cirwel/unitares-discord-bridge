@@ -257,6 +257,117 @@ def build_lumen_embed(state: dict) -> discord.Embed:
     return build_sensor_embed(state)
 
 
+SESSIONS_MAX_ROWS = 15
+
+
+def _relative_age(iso_ts: str | None, now: datetime) -> str:
+    """'4m ago' style age for an ISO timestamp; '?' when absent or unparsable."""
+    if not iso_ts:
+        return "?"
+    try:
+        ts = datetime.fromisoformat(iso_ts)
+    except (TypeError, ValueError):
+        return "?"
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    seconds = max(0, int((now - ts).total_seconds()))
+    if seconds < 60:
+        return f"{seconds}s ago"
+    if seconds < 3600:
+        return f"{seconds // 60}m ago"
+    if seconds < 86400:
+        return f"{seconds // 3600}h ago"
+    return f"{seconds // 86400}d ago"
+
+
+def build_sessions_embed(
+    timeline: dict,
+    *,
+    harness: str | None = None,
+    hub_url: str = "",
+    now: datetime | None = None,
+) -> discord.Embed:
+    """Read-only roster of recent agent sessions from GET /v1/timeline.
+
+    One row per agent with a declared host session (portal hub H0), newest
+    activity first: harness, governance status, resumability and a short
+    vendor session id. Agents active in the window without one (residents,
+    agents onboarded before H0) are summarised in one line, not listed.
+    ``resumable`` means only that the record holds enough to attempt a
+    resume; it does not mean the vendor still has the session.
+
+    ``harness`` filters by prefix, so ``claude`` matches ``claude-code`` and
+    ``claude-code-web``.
+
+    Resuming or starting a session is the portal hub's job (H3/H4), so this
+    embed links there and acts on nothing. Bridge /resume is a different
+    thing: it releases a governance pause.
+    """
+    now = now or datetime.now(timezone.utc)
+    agents = [a for a in (timeline.get("agents") or []) if isinstance(a, dict)]
+    agents.sort(key=lambda a: a.get("last_activity_at") or "", reverse=True)
+    sessions = [a for a in agents if isinstance(a.get("host_session"), dict)]
+    others = [a for a in agents if not isinstance(a.get("host_session"), dict)]
+    want = (harness or "").strip().lower()
+    if want:
+        sessions = [
+            a for a in sessions
+            if (a["host_session"].get("harness") or "").lower().startswith(want)
+        ]
+
+    hours = (timeline.get("window") or {}).get("hours")
+    title = "Agent sessions (read-only)"
+    embed = discord.Embed(
+        title=title,
+        colour=discord.Colour.blurple(),
+        timestamp=now,
+    )
+    if hub_url:
+        embed.url = hub_url
+
+    lines = []
+    if not sessions:
+        scope = f" for harness `{want}`" if want else ""
+        lines.append(f"No recorded host sessions{scope} in the last {hours or '?'}h.")
+    else:
+        for a in sessions[:SESSIONS_MAX_ROWS]:
+            hs = a["host_session"]
+            label = a.get("label") or (a.get("agent_id") or "?")[:8]
+            short_sid = (hs.get("session_id") or "")[:8]
+            resume = (
+                f"resumable `{short_sid}`" if hs.get("resumable")
+                else f"not resumable `{short_sid}`"
+            )
+            status = a.get("status") or "?"
+            age = _relative_age(a.get("last_activity_at"), now)
+            lines.append(
+                f"**{label}** · {hs.get('harness') or '?'} · {status} · {resume} · {age}"
+            )
+        more = len(sessions) - SESSIONS_MAX_ROWS
+        if more > 0:
+            lines.append(f"…and {more} more")
+    if others and not want:
+        names = ", ".join((a.get("label") or (a.get("agent_id") or "?")[:8]) for a in others[:5])
+        extra = f" +{len(others) - 5}" if len(others) > 5 else ""
+        lines.append(f"_{len(others)} other active agent(s) without a recorded session: {names}{extra}_")
+    embed.description = "\n".join(lines)
+
+    if hub_url:
+        embed.add_field(
+            name="Resume or start",
+            value=f"[Open the portal hub]({hub_url})",
+            inline=False,
+        )
+
+    footer = [f"Last {hours or '?'}h"]
+    truncated = timeline.get("truncated") or []
+    if truncated:
+        footer.append(f"truncated: {', '.join(truncated)}")
+    footer.append("/resume releases a governance pause; it does not resume a session")
+    embed.set_footer(text=" · ".join(footer))
+    return embed
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -362,7 +473,10 @@ def setup_commands(
                 embed=_error_embed("Health check failed."),
             )
 
-    @tree.command(name="resume", description="Resume a paused agent")
+    @tree.command(
+        name="resume",
+        description="Release a governance pause on an agent (not a session resume)",
+    )
     @app_commands.describe(agent="Agent ID to resume")
     async def cmd_resume(interaction: discord.Interaction, agent: str) -> None:
         # Guard: only users with Manage Server permission or the 'Governance Admin'
@@ -473,6 +587,38 @@ def setup_commands(
             log.error("/digest error: %s", exc)
             await interaction.followup.send(
                 embed=_error_embed("Failed to build digest."),
+            )
+
+    @tree.command(
+        name="sessions",
+        description="Recent agent sessions: harness, status, resumability (read-only)",
+    )
+    @app_commands.describe(
+        hours="Lookback window in hours (1-168, default 24)",
+        harness="Harness prefix, e.g. claude (matches claude-code, claude-code-web), codex",
+    )
+    async def cmd_sessions(
+        interaction: discord.Interaction,
+        hours: app_commands.Range[int, 1, 168] = 24,
+        harness: str | None = None,
+    ) -> None:
+        await interaction.response.defer()
+        try:
+            from bridge.config import PORTAL_HUB_URL
+            timeline = await gov_client.fetch_timeline(hours=hours)
+            if timeline is None:
+                await interaction.followup.send(
+                    embed=_error_embed("Governance timeline unavailable."),
+                )
+                return
+            embed = build_sessions_embed(
+                timeline, harness=harness, hub_url=PORTAL_HUB_URL,
+            )
+            await interaction.followup.send(embed=embed)
+        except Exception as exc:
+            log.error("/sessions error: %s", exc)
+            await interaction.followup.send(
+                embed=_error_embed("Failed to list sessions."),
             )
 
     @tree.command(name="lumen", description="Current Lumen state and sensors")

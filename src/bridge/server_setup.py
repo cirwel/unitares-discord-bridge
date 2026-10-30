@@ -26,7 +26,7 @@ CHANNEL_STRUCTURE: dict[str, dict[str, dict[str, str]]] = {
         "lumen-digest": {"type": "text", "topic": "Weekly Q&A digest — what Lumen wondered about, and when to visit live"},
     },
     "CONTROL": {
-        "commands": {"type": "text", "topic": "Bridge slash commands: /status /agent /health /lumen /kg /digest /resume. They work in any channel; this is a quiet place to run them. /status is a snapshot, not a live view (see #governance-hud)."},
+        "commands": {"type": "text", "topic": "Bridge slash commands: /status /agent /health /lumen /kg /digest /sessions /resume. They work in any channel; this is a quiet place to run them. /status is a snapshot, not a live view (see #governance-hud). /sessions is read-only; /resume releases a governance pause, not a vendor session."},
         "audit-log": {"type": "text", "topic": "All bot actions logged here"},
     },
 }
