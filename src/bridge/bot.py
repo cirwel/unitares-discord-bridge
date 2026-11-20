@@ -202,35 +202,47 @@ async def on_ready():
     handoff_ch: discord.TextChannel | None = None
     if handoff_config is not None:
         ch = bot.get_channel(handoff_config.channel_id)
-        # The mention must be a bot other than this one: a person's id would
-        # ping them on every stalled PR, and our own would address ourselves.
-        target_is_bot = False
-        try:
-            target = await bot.fetch_user(handoff_config.user_id)
-            target_is_bot = bool(getattr(target, "bot", False)) and (
-                bot.user is None or target.id != bot.user.id
-            )
-        except Exception as exc:  # noqa: BLE001 - an unverifiable target disables it
-            log.warning("Dispatch handoff: could not look up the mentioned user: %s", exc)
-        if not target_is_bot:
-            log.warning(
-                "BRIDGE_DISPATCH_HANDOFF_MENTION does not name another bot — "
-                "dispatch handoff disabled"
-            )
-            handoff_config = None
-        elif isinstance(ch, discord.TextChannel):
-            handoff_ch = ch
-            log.info(
-                "Dispatch handoff enabled: stalled draft PRs under %s go to #%s (%d)",
-                ",".join(sorted(handoff_config.owners)), ch.name, ch.id,
-            )
-        else:
+        if not isinstance(ch, discord.TextChannel):
             log.warning(
                 "BRIDGE_DISPATCH_HANDOFF_CHANNEL_ID=%d resolved to %r; expected "
                 "TextChannel — dispatch handoff disabled",
                 handoff_config.channel_id, ch,
             )
             handoff_config = None
+        elif alerts_ch is not None and ch.id == alerts_ch.id:
+            # #alerts posts jump the send queue and may evict routine embeds;
+            # a handoff must never push out the finding it is about.
+            log.warning("Dispatch handoff channel is #alerts — dispatch handoff disabled")
+            handoff_config = None
+        else:
+            # The mention must be a bot other than this one: a person's id
+            # would ping them on every stalled PR, and our own would address
+            # ourselves. Checked last and bounded, so a slow lookup for an
+            # optional feature cannot hold up the event feeds for long.
+            target_is_bot = False
+            try:
+                target = await asyncio.wait_for(
+                    bot.fetch_user(handoff_config.user_id), timeout=5.0,
+                )
+                target_is_bot = bool(getattr(target, "bot", False)) and (
+                    bot.user is None or target.id != bot.user.id
+                )
+            except Exception as exc:  # noqa: BLE001 - unverifiable target disables it
+                log.warning(
+                    "Dispatch handoff: could not look up the mentioned user: %r", exc,
+                )
+            if target_is_bot:
+                handoff_ch = ch
+                log.info(
+                    "Dispatch handoff enabled: stalled draft PRs under %s go to #%s (%d)",
+                    ",".join(sorted(handoff_config.owners)), ch.name, ch.id,
+                )
+            else:
+                log.warning(
+                    "BRIDGE_DISPATCH_HANDOFF_MENTION does not name another bot — "
+                    "dispatch handoff disabled"
+                )
+                handoff_config = None
     elif DISPATCH_HANDOFF_CHANNEL_ID or DISPATCH_HANDOFF_MENTION or DISPATCH_HANDOFF_REPO_OWNERS:
         log.warning(
             "Dispatch handoff settings are incomplete or malformed — handoff "

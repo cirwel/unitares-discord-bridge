@@ -70,6 +70,8 @@ def test_nickname_mention_form_is_normalised():
     ("424242", f"<@{BOT}>", "*"),
     ("424242", f"<@{BOT}>", "acme/co, ../x"),
     ("424242", f"<@{BOT}>", "acmeco, bad/owner"),   # one bad entry disables it
+    ("424242", f"<@{BOT}>", "acmeco,,other-org"),   # so does an empty one
+    ("424242", f"<@{BOT}>", "acmeco,"),
     ("٤٢٤٢٤٢", f"<@{BOT}>", "acmeco"),            # non-ASCII digits
     ("424242\n", f"<@{BOT}>X", "acmeco"),
     ("424242", f"<@{BOT}>\nextra", "acmeco"),

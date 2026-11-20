@@ -92,10 +92,10 @@ def parse_config(
     match = _MENTION_RE.fullmatch((mention or "").strip())
     if match is None:
         return None
-    entries = [o.strip() for o in (owners or "").split(",") if o.strip()]
-    # One bad entry disables the handoff: a list that is partly wrong is a
-    # misconfiguration, not a narrower allowlist.
-    if not entries or any(_OWNER_RE.fullmatch(o) is None for o in entries):
+    entries = [o.strip() for o in (owners or "").split(",")]
+    # One bad entry, an empty one included, disables the handoff: a list that
+    # is partly wrong is a misconfiguration, not a narrower allowlist.
+    if any(_OWNER_RE.fullmatch(o) is None for o in entries):
         return None
     user_id = int(match.group(1))
     return HandoffConfig(
