@@ -22,6 +22,7 @@ from bridge.embeds import (
     is_finding_event,
 )
 from bridge.delivery import DiscordSender
+from bridge.dispatch_handoff import HandoffConfig, handoff_outgoing
 from bridge.mcp_client import GovernanceClient, fetch_agents
 from bridge.tasks import cancel_tasks, create_logged_task
 
@@ -69,8 +70,13 @@ class EventPoller:
         delivery_cache: FindingDeliveryCache | None = None,
         tag_resolver: AgentTagResolver | None = None,
         embodied_channel: discord.TextChannel | None = None,
+        handoff_channel: discord.TextChannel | None = None,
+        handoff_config: HandoffConfig | None = None,
     ) -> None:
         self.gov = gov_client
+        # Dispatch handoff (bridge/dispatch_handoff.py). Both None = off.
+        self.handoff_channel = handoff_channel
+        self.handoff_config = handoff_config
         # Reads the subject agent's governance tags for resident-only and
         # embodied routing. None disables both (every event posts as before).
         self.tag_resolver = tag_resolver
@@ -300,6 +306,7 @@ class EventPoller:
                             else self.signals_channel
                         )
                     await self._enqueue(target, embed, event)
+                    await self._enqueue_handoff(event)
                     # A finding already went to its one channel (#alerts when
                     # critical); everything else mirrors critical to #alerts.
                     if not is_finding_event(event) and is_critical_event(event):
@@ -412,6 +419,22 @@ class EventPoller:
                 "bridge.delivery_failed",
                 source_event=event,
                 channel=channel,
+                reason="send_queue_full",
+            )
+
+    async def _enqueue_handoff(self, event: dict) -> None:
+        """Also address a qualifying finding to a dispatch agent, if configured."""
+        item = handoff_outgoing(event, self.handoff_channel, self.handoff_config)
+        if item is None:
+            return
+        try:
+            self._message_queue.put_nowait(item)
+        except asyncio.QueueFull:
+            log.warning("Send queue full; dropping dispatch handoff")
+            await self._record_receipt(
+                "bridge.delivery_failed",
+                source_event=event,
+                channel=self.handoff_channel,
                 reason="send_queue_full",
             )
 

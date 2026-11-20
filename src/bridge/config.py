@@ -41,6 +41,22 @@ PORTAL_HUB_URL = os.environ.get("PORTAL_HUB_URL", "").strip()
 # twice per outage) so this cannot become a notification firehose.
 LUMEN_OFFLINE_MENTION = os.environ.get("LUMEN_OFFLINE_MENTION", "").strip()
 
+# Hand Vigil's stalled-draft-PR findings to a dispatch agent (see
+# bridge/dispatch_handoff.py). All three must be set and well-formed, or the
+# handoff is off, which is the default:
+#   BRIDGE_DISPATCH_HANDOFF_CHANNEL_ID   channel id where that dispatch bot
+#                                        starts sessions
+#   BRIDGE_DISPATCH_HANDOFF_MENTION      the dispatch bot, as one user mention:
+#                                        "<@123456789>" (not a role)
+#   BRIDGE_DISPATCH_HANDOFF_REPO_OWNERS  GitHub owners whose PRs may be handed
+#                                        off, comma-separated; no wildcard
+# The dispatch bot must also list this bridge's bot id in its own
+# DISPATCH_TRIGGER_BOT_IDS, or the post starts nothing. Each handoff starts an
+# agent run, so this is a spend switch as well as a routing one.
+DISPATCH_HANDOFF_CHANNEL_ID = os.environ.get("BRIDGE_DISPATCH_HANDOFF_CHANNEL_ID", "").strip()
+DISPATCH_HANDOFF_MENTION = os.environ.get("BRIDGE_DISPATCH_HANDOFF_MENTION", "").strip()
+DISPATCH_HANDOFF_REPO_OWNERS = os.environ.get("BRIDGE_DISPATCH_HANDOFF_REPO_OWNERS", "").strip()
+
 # File the bridge writes its own log to, through a WatchedFileHandler that
 # reopens the path after newsyslog renames it. Unset (the default) logs to
 # stderr as before. Under launchd, stdout/stderr are file descriptors opened

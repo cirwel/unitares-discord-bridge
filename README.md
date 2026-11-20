@@ -141,6 +141,31 @@ channel whose job changes stops advertising the old one. Set
 needs Manage Channels to rewrite a topic; without it the edit is logged and
 skipped.
 
+### Handing a finding to a dispatch agent
+
+Off by default. When all three of these are set, Vigil's per-PR
+stalled-draft-PR finding (`vigil_finding`, `finding_type=stalled_draft_pr`) is
+also posted as a plain message that @-mentions a dispatch bot, so an agent is
+started to look at the PR:
+
+| Variable | Value |
+|---|---|
+| `BRIDGE_DISPATCH_HANDOFF_CHANNEL_ID` | Id of a channel where that dispatch bot starts sessions. |
+| `BRIDGE_DISPATCH_HANDOFF_MENTION` | The dispatch bot as one user mention, `<@123456789>`. Not a role. |
+| `BRIDGE_DISPATCH_HANDOFF_REPO_OWNERS` | GitHub owners whose PRs may be handed off, comma-separated. No wildcard. |
+
+The dispatch bot must also list this bridge's bot id in its own
+`DISPATCH_TRIGGER_BOT_IDS`; otherwise the message starts nothing. Each handoff
+starts an agent run, so turning this on is a spending decision.
+
+The message is fixed text plus the repository, the PR number and the PR's
+agent signature, each validated. The finding's own message and link are never
+copied in, because the text becomes an agent's prompt. It asks for a diagnosis
+and tells the agent not to push to a PR it does not own, merge it, or mark it
+ready. No other finding class is handed off, and which class is not
+configurable. The finding's ordinary embed still posts to its usual channel.
+See `src/bridge/dispatch_handoff.py`.
+
 ### Operator-managed channels
 
 `DISCORD_LEASE_PLANE_PHASE_B_CHANNEL_ID` (optional) is the id of a channel the
