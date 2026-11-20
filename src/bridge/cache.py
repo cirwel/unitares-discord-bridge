@@ -72,6 +72,10 @@ class FindingDeliveryCache:
             "type", "event_id", "timestamp", "agent_id", "severity",
             "fingerprint", "message", "tags", "evidence",
         )]
+        if send_kwargs.get("content") is not None:
+            # A text post about a finding (the dispatch handoff) is a different
+            # message from that finding's embed, even in the same channel.
+            identity.append("text")
         key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
         # Only identical sends wait on each other; an unrelated critical alert
         # must not wait behind another channel's network operation.

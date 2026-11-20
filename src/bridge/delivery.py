@@ -125,7 +125,7 @@ async def send_with_retry(
 # ---------------------------------------------------------------------------
 
 
-def message_nonce(channel: Any, source_event: dict | None) -> str:
+def message_nonce(channel: Any, source_event: dict | None, kind: str = "") -> str:
     """A nonce stable across retries of one logical message.
 
     Derived from the destination and the source event's identity when there
@@ -138,6 +138,10 @@ def message_nonce(channel: Any, source_event: dict | None) -> str:
             getattr(channel, "id", None),
             *(event.get(k) for k in ("type", "event_id", "timestamp", "agent_id", "fingerprint")),
         ]
+        if kind:
+            # A second message about the same event in the same channel (the
+            # dispatch handoff beside the embed) needs its own nonce.
+            identity.append(kind)
         raw = json.dumps(identity, sort_keys=True, default=str).encode()
         return hashlib.sha256(raw).hexdigest()[:_NONCE_LEN]
     return uuid.uuid4().hex[:_NONCE_LEN]
@@ -148,15 +152,36 @@ class Outgoing:
     """One queued Discord message and its delivery state."""
 
     channel: Any
-    embed: discord.Embed
+    # None for a text-only post, which then must carry ``content``.
+    embed: discord.Embed | None
     source_event: dict | None = None
     attempts: int = 0
     nonce: str = ""
     enqueued_at: float = field(default_factory=time.monotonic)
+    # Plain text sent alongside (or instead of) the embed, and the mentions it
+    # may ping. Unset for every ordinary post, which stays silent. See
+    # bridge/dispatch_handoff.py for the one user of these.
+    content: str | None = None
+    allowed_mentions: Any = None
+
+    def send_kwargs(self) -> dict:
+        """Extra ``channel.send`` arguments for a post that carries text.
+
+        Empty for an ordinary embed post. A text post always states its
+        mentions explicitly: with none given, nothing is pinged.
+        """
+        if self.content is None:
+            return {}
+        return {
+            "content": self.content,
+            "allowed_mentions": self.allowed_mentions or discord.AllowedMentions.none(),
+        }
 
     def __post_init__(self) -> None:
         if not self.nonce:
-            self.nonce = message_nonce(self.channel, self.source_event)
+            self.nonce = message_nonce(
+                self.channel, self.source_event, "text" if self.content is not None else "",
+            )
 
 
 def as_outgoing(item: Any) -> Outgoing:
@@ -356,8 +381,11 @@ class DiscordSender:
         if self.delivery_cache is not None:
             return await self.delivery_cache.send(
                 item.channel, item.embed, item.source_event, nonce=item.nonce,
+                **item.send_kwargs(),
             )
-        message = await item.channel.send(embed=item.embed, nonce=item.nonce)
+        message = await item.channel.send(
+            embed=item.embed, nonce=item.nonce, **item.send_kwargs(),
+        )
         return getattr(message, "id", None), False
 
     async def _handle_unreachable(self, item: Outgoing, exc: BaseException) -> None:

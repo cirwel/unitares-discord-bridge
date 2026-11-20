@@ -36,6 +36,7 @@ from bridge import config
 from bridge.agent_labels import AgentLabelCache
 from bridge.cache import FindingDeliveryCache
 from bridge.delivery import DiscordSender
+from bridge.dispatch_handoff import HandoffConfig, handoff_outgoing
 from bridge.embeds import (
     attention_severity, event_to_embed, finding_destination,
     PHASE_B_TYPES, finding_needs_operator, is_critical_event,
@@ -377,8 +378,13 @@ class WSEventSubscriber:
         residents_channel: Optional[discord.TextChannel] = None,
         delivery_cache: FindingDeliveryCache | None = None,
         label_cache: AgentLabelCache | None = None,
+        handoff_channel: Optional[discord.TextChannel] = None,
+        handoff_config: HandoffConfig | None = None,
     ) -> None:
         self.ws_url = ws_url_from_http(governance_url)
+        # Dispatch handoff (bridge/dispatch_handoff.py). Both None = off.
+        self.handoff_channel = handoff_channel
+        self.handoff_config = handoff_config
         self.gov = gov_client
         # Names a subject that arrives with only an agent_id; None leaves the
         # UUID fragment.
@@ -619,6 +625,19 @@ class WSEventSubscriber:
             )
             # No return: the #alerts mirror below can still evict a routine
             # post (SendQueue) and must not be lost with the routine copy.
+        # A qualifying finding is also addressed to a dispatch agent. The
+        # delivery cache makes this one post with the REST poller's copy.
+        handoff = handoff_outgoing(event, self.handoff_channel, self.handoff_config)
+        if handoff is not None:
+            try:
+                self._send_queue.put_nowait(handoff)
+            except asyncio.QueueFull:
+                await self._record_receipt(
+                    "bridge.delivery_failed",
+                    source_event=event,
+                    channel=self.handoff_channel,
+                    reason="send_queue_full",
+                )
         # Findings were routed to their one channel above (#alerts when they
         # need the operator); only non-findings mirror.
         if not is_finding_event(event) and is_critical_broadcaster_event(event):

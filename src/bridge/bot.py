@@ -19,7 +19,9 @@ from bridge.config import (
     AGENT_TAGS_TTL_SECONDS, AGENT_TAGS_NONRESIDENT_TTL_SECONDS,
     AGENT_TAGS_FAILURE_TTL_SECONDS, RESIDENT_AGENT_TAGS, EMBODIED_STATE_CHANNEL,
     BRIDGE_LOG_PATH,
+    DISPATCH_HANDOFF_CHANNEL_ID, DISPATCH_HANDOFF_MENTION, DISPATCH_HANDOFF_REPO_OWNERS,
 )
+from bridge.dispatch_handoff import parse_config as parse_handoff_config
 from bridge.agent_labels import AgentLabelCache
 from bridge.agent_tags import AgentTagResolver
 from bridge.cache import BridgeCache, FindingDeliveryCache
@@ -192,6 +194,61 @@ async def on_ready():
         if isinstance(ch := channels.get(key), discord.TextChannel)
     }
 
+    # Dispatch handoff: off unless all three settings parse AND the channel is
+    # a text channel this bot can see. Looked up by id; the operator names it.
+    handoff_config = parse_handoff_config(
+        DISPATCH_HANDOFF_CHANNEL_ID, DISPATCH_HANDOFF_MENTION, DISPATCH_HANDOFF_REPO_OWNERS,
+    )
+    handoff_ch: discord.TextChannel | None = None
+    if handoff_config is not None:
+        ch = bot.get_channel(handoff_config.channel_id)
+        if not isinstance(ch, discord.TextChannel):
+            log.warning(
+                "BRIDGE_DISPATCH_HANDOFF_CHANNEL_ID=%d resolved to %r; expected "
+                "TextChannel — dispatch handoff disabled",
+                handoff_config.channel_id, ch,
+            )
+            handoff_config = None
+        elif alerts_ch is not None and ch.id == alerts_ch.id:
+            # #alerts posts jump the send queue and may evict routine embeds;
+            # a handoff must never push out the finding it is about.
+            log.warning("Dispatch handoff channel is #alerts — dispatch handoff disabled")
+            handoff_config = None
+        else:
+            # The mention must be a bot other than this one: a person's id
+            # would ping them on every stalled PR, and our own would address
+            # ourselves. Checked last and bounded, so a slow lookup for an
+            # optional feature cannot hold up the event feeds for long.
+            target_is_bot = False
+            try:
+                target = await asyncio.wait_for(
+                    bot.fetch_user(handoff_config.user_id), timeout=5.0,
+                )
+                target_is_bot = bool(getattr(target, "bot", False)) and (
+                    bot.user is None or target.id != bot.user.id
+                )
+            except Exception as exc:  # noqa: BLE001 - unverifiable target disables it
+                log.warning(
+                    "Dispatch handoff: could not look up the mentioned user: %r", exc,
+                )
+            if target_is_bot:
+                handoff_ch = ch
+                log.info(
+                    "Dispatch handoff enabled: stalled draft PRs under %s go to #%s (%d)",
+                    ",".join(sorted(handoff_config.owners)), ch.name, ch.id,
+                )
+            else:
+                log.warning(
+                    "BRIDGE_DISPATCH_HANDOFF_MENTION does not name another bot — "
+                    "dispatch handoff disabled"
+                )
+                handoff_config = None
+    elif DISPATCH_HANDOFF_CHANNEL_ID or DISPATCH_HANDOFF_MENTION or DISPATCH_HANDOFF_REPO_OWNERS:
+        log.warning(
+            "Dispatch handoff settings are incomplete or malformed — handoff "
+            "disabled (need a channel id, one <@user> mention and repo owners)"
+        )
+
     if activity_ch and signals_ch and alerts_ch:
         # Persisted so a restart cannot re-post findings the WS path already
         # delivered (the REST cursor survives restarts; a memory map does not).
@@ -207,6 +264,8 @@ async def on_ready():
             residents_channel=residents_ch,
             resident_channels=resident_channels,
             delivery_cache=delivery_cache,
+            handoff_channel=handoff_ch,
+            handoff_config=handoff_config,
             tag_resolver=AgentTagResolver(
                 gov_client,
                 ttl=AGENT_TAGS_TTL_SECONDS,
@@ -271,6 +330,8 @@ async def on_ready():
             residents_channel=residents_ch,
             delivery_cache=delivery_cache,
             label_cache=AgentLabelCache(gov_client),
+            handoff_channel=handoff_ch,
+            handoff_config=handoff_config,
         )
         await ws_subscriber.start()
         log.info(
