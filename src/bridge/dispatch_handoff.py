@@ -28,6 +28,14 @@ Rules this module holds to:
   delivery cache as every finding, so the REST and WebSocket copies of one
   finding produce one handoff, across restarts.
 
+What this does NOT establish: that the finding really came from Vigil.
+Governance's ``/api/findings`` takes ``type``, ``finding_type`` and
+``agent_id`` from whoever holds its HTTP token, and the bridge has nothing
+better to check. So with the handoff on, any holder of that token can start a
+diagnose-only agent run against a PR of an allowlisted owner, with the fixed
+text below. That is the trust this feature extends, and it is why the text is
+fixed, the owners are allowlisted and the request stops at a diagnosis.
+
 The volume is bounded upstream (Vigil posts once per stall episode) and
 downstream (dispatch caps starts per trusted bot per hour).
 """
@@ -46,12 +54,17 @@ HANDOFF_EVENT_TYPE = "vigil_finding"
 HANDOFF_FINDING_TYPE = "stalled_draft_pr"
 HANDOFF_AGENT_ID = "vigil"
 
-_MENTION_RE = re.compile(r"^<@!?(\d{5,25})>$")
-_REPO_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9_.-]{1,100})$")
+# Every pattern here is used with ``fullmatch``: ``$`` also matches before a
+# trailing newline, which would let one through into the message. Digits are
+# spelled ``[0-9]`` because ``\d`` and ``str.isdigit`` accept non-ASCII digits.
+_CHANNEL_RE = re.compile(r"[0-9]{5,25}")
+_MENTION_RE = re.compile(r"<@!?([0-9]{5,25})>")
+_OWNER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}")
+_REPO_RE = re.compile(r"([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9_.-]{1,100})")
 _UUID_RE = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 )
-_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
+_MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}")
 
 
 @dataclass(frozen=True)
@@ -74,24 +87,22 @@ def parse_config(
     repositories may be handed off; there is no wildcard.
     """
     raw_channel = (channel_id or "").strip()
-    if not raw_channel.isdigit() or int(raw_channel) <= 0:
+    if _CHANNEL_RE.fullmatch(raw_channel) is None:
         return None
-    match = _MENTION_RE.match((mention or "").strip())
+    match = _MENTION_RE.fullmatch((mention or "").strip())
     if match is None:
         return None
-    owner_set = frozenset(
-        o.strip().lower()
-        for o in (owners or "").split(",")
-        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", o.strip())
-    )
-    if not owner_set:
+    entries = [o.strip() for o in (owners or "").split(",") if o.strip()]
+    # One bad entry disables the handoff: a list that is partly wrong is a
+    # misconfiguration, not a narrower allowlist.
+    if not entries or any(_OWNER_RE.fullmatch(o) is None for o in entries):
         return None
     user_id = int(match.group(1))
     return HandoffConfig(
         channel_id=int(raw_channel),
         mention=f"<@{user_id}>",
         user_id=user_id,
-        owners=owner_set,
+        owners=frozenset(o.lower() for o in entries),
     )
 
 
@@ -100,7 +111,7 @@ def _pr_identity(event: dict, owners: frozenset[str]) -> tuple[str, int] | None:
     number = event.get("number")
     if not isinstance(repo, str) or isinstance(number, bool) or not isinstance(number, int):
         return None
-    match = _REPO_RE.match(repo)
+    match = _REPO_RE.fullmatch(repo)
     if match is None or number <= 0 or number > 10_000_000:
         return None
     if match.group(1).lower() not in owners or ".." in match.group(2):
@@ -129,9 +140,9 @@ def handoff_text(event: Any, config: HandoffConfig | None) -> str | None:
 
     uuid = event.get("author_agent_uuid")
     model = event.get("author_model")
-    if isinstance(uuid, str) and _UUID_RE.match(uuid):
+    if isinstance(uuid, str) and _UUID_RE.fullmatch(uuid):
         author = f"The PR body is signed by agent {uuid}"
-        if isinstance(model, str) and _MODEL_RE.match(model):
+        if isinstance(model, str) and _MODEL_RE.fullmatch(model):
             author += f" (model {model})"
         author += "."
     else:
@@ -159,7 +170,16 @@ def handoff_outgoing(
     ``channel`` is the resolved handoff channel; ``None`` (not found, or not a
     text channel) disables the handoff whatever the config says.
     """
-    if channel is None or config is None:
+    if channel is None or config is None or not isinstance(event, dict):
+        return None
+    # Only a finding the delivery cache can deduplicate is handed off. Without
+    # an event id, a timestamp and a channel id the cache sends every copy, so
+    # the REST and WebSocket copies would each start an agent run.
+    if (
+        event.get("event_id") is None
+        or not event.get("timestamp")
+        or not isinstance(getattr(channel, "id", None), int)
+    ):
         return None
     text = handoff_text(event, config)
     if text is None:

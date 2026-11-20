@@ -46,12 +46,12 @@ def _channel(name: str, cid: int) -> MagicMock:
 
 
 def test_parse_config_accepts_a_complete_setting():
-    cfg = parse_config("42", f"<@{BOT}>", "AcmeCo, other-org")
-    assert cfg == HandoffConfig(42, f"<@{BOT}>", BOT, frozenset({"acmeco", "other-org"}))
+    cfg = parse_config("424242", f"<@{BOT}>", "AcmeCo, other-org")
+    assert cfg == HandoffConfig(424242, f"<@{BOT}>", BOT, frozenset({"acmeco", "other-org"}))
 
 
 def test_nickname_mention_form_is_normalised():
-    assert parse_config("42", f"<@!{BOT}>", "acmeco").mention == f"<@{BOT}>"
+    assert parse_config("424242", f"<@!{BOT}>", "acmeco").mention == f"<@{BOT}>"
 
 
 @pytest.mark.parametrize("channel, mention, owners", [
@@ -59,16 +59,20 @@ def test_nickname_mention_form_is_normalised():
     (None, f"<@{BOT}>", "acmeco"),
     ("general", f"<@{BOT}>", "acmeco"),
     ("0", f"<@{BOT}>", "acmeco"),
-    ("42", "", "acmeco"),
-    ("42", "@everyone", "acmeco"),
-    ("42", "@here", "acmeco"),
-    ("42", f"<@&{BOT}>", "acmeco"),            # a role
-    ("42", f"<@{BOT}> <@999999999>", "acmeco"),  # two mentions
-    ("42", f"hey <@{BOT}>", "acmeco"),
-    ("42", str(BOT), "acmeco"),
-    ("42", f"<@{BOT}>", ""),
-    ("42", f"<@{BOT}>", "*"),
-    ("42", f"<@{BOT}>", "acme/co, ../x"),
+    ("424242", "", "acmeco"),
+    ("424242", "@everyone", "acmeco"),
+    ("424242", "@here", "acmeco"),
+    ("424242", f"<@&{BOT}>", "acmeco"),            # a role
+    ("424242", f"<@{BOT}> <@999999999>", "acmeco"),  # two mentions
+    ("424242", f"hey <@{BOT}>", "acmeco"),
+    ("424242", str(BOT), "acmeco"),
+    ("424242", f"<@{BOT}>", ""),
+    ("424242", f"<@{BOT}>", "*"),
+    ("424242", f"<@{BOT}>", "acme/co, ../x"),
+    ("424242", f"<@{BOT}>", "acmeco, bad/owner"),   # one bad entry disables it
+    ("٤٢٤٢٤٢", f"<@{BOT}>", "acmeco"),            # non-ASCII digits
+    ("424242\n", f"<@{BOT}>X", "acmeco"),
+    ("424242", f"<@{BOT}>\nextra", "acmeco"),
 ])
 def test_parse_config_fails_closed(channel, mention, owners):
     assert parse_config(channel, mention, owners) is None
@@ -98,6 +102,8 @@ def test_stalled_pr_finding_gets_fixed_text_with_the_mention_first():
     {"repo": "acmeco/.."},
     {"repo": "acmeco/wid gets"},
     {"repo": "acmeco/widgets\n@everyone"},
+    {"repo": "acmeco/widgets\n"},           # trailing newline must not pass
+    {"repo": "\nacmeco/widgets"},
     {"repo": None},
     {"number": "12"},
     {"number": 0},
@@ -140,6 +146,7 @@ def test_free_text_fields_are_never_copied_in():
     ("not-a-uuid", "claude-test-1"),
     (None, None),
     ("ABCDEF12-2222-3333-4444-555555555555", "claude-test-1"),  # not lowercase
+    (UUID + "\n", "claude-test-1"),
 ])
 def test_bad_signature_is_reported_as_none_not_echoed(uuid, model):
     text = handoff_text(_finding(author_agent_uuid=uuid, author_model=model), CFG)
@@ -147,7 +154,9 @@ def test_bad_signature_is_reported_as_none_not_echoed(uuid, model):
     assert "IGNORE" not in text
 
 
-@pytest.mark.parametrize("model", [INJECTION, "has space", "x" * 80, "", None, 7, "a\nb"])
+@pytest.mark.parametrize(
+    "model", [INJECTION, "has space", "x" * 80, "", None, 7, "a\nb", "claude-test-1\n"]
+)
 def test_bad_model_is_dropped_but_the_uuid_stays(model):
     text = handoff_text(_finding(author_model=model), CFG)
     assert UUID in text and "(model" not in text
@@ -176,6 +185,20 @@ def test_no_channel_or_no_config_means_no_post():
     assert handoff_outgoing(_finding(), None, CFG) is None
     assert handoff_outgoing(_finding(), _channel("x", 42), None) is None
     assert handoff_outgoing(_finding(type="sentinel_finding"), _channel("x", 42), CFG) is None
+
+
+@pytest.mark.parametrize("over", [
+    {"event_id": None}, {"timestamp": None}, {"timestamp": ""},
+])
+def test_a_finding_the_cache_cannot_deduplicate_is_not_handed_off(over):
+    """Without these the cache sends every copy: two transports, two agent runs."""
+    assert handoff_outgoing(_finding(**over), _channel("x", 42), CFG) is None
+
+
+def test_a_channel_without_an_integer_id_is_not_used():
+    ch = _channel("x", 42)
+    ch.id = "42"
+    assert handoff_outgoing(_finding(), ch, CFG) is None
 
 
 def test_ordinary_embed_posts_send_no_extra_arguments():

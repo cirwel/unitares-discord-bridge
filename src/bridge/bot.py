@@ -202,7 +202,23 @@ async def on_ready():
     handoff_ch: discord.TextChannel | None = None
     if handoff_config is not None:
         ch = bot.get_channel(handoff_config.channel_id)
-        if isinstance(ch, discord.TextChannel):
+        # The mention must be a bot other than this one: a person's id would
+        # ping them on every stalled PR, and our own would address ourselves.
+        target_is_bot = False
+        try:
+            target = await bot.fetch_user(handoff_config.user_id)
+            target_is_bot = bool(getattr(target, "bot", False)) and (
+                bot.user is None or target.id != bot.user.id
+            )
+        except Exception as exc:  # noqa: BLE001 - an unverifiable target disables it
+            log.warning("Dispatch handoff: could not look up the mentioned user: %s", exc)
+        if not target_is_bot:
+            log.warning(
+                "BRIDGE_DISPATCH_HANDOFF_MENTION does not name another bot — "
+                "dispatch handoff disabled"
+            )
+            handoff_config = None
+        elif isinstance(ch, discord.TextChannel):
             handoff_ch = ch
             log.info(
                 "Dispatch handoff enabled: stalled draft PRs under %s go to #%s (%d)",
