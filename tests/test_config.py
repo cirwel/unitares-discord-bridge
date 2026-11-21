@@ -72,3 +72,18 @@ def test_self_iteration_attention_can_be_configured(monkeypatch):
         monkeypatch.delenv("LUMEN_SELF_ITERATION_ENABLED", raising=False)
         monkeypatch.delenv("LUMEN_SELF_ITERATION_POLL_INTERVAL", raising=False)
         importlib.reload(config)
+
+
+def test_dispatch_handoff_vigil_agent_uuid_defaults_empty_and_strips(monkeypatch):
+    monkeypatch.delenv("BRIDGE_DISPATCH_HANDOFF_VIGIL_AGENT_UUID", raising=False)
+    try:
+        reloaded = importlib.reload(config)
+        assert reloaded.DISPATCH_HANDOFF_VIGIL_AGENT_UUID == ""
+        reloaded = _reload_with(
+            monkeypatch,
+            BRIDGE_DISPATCH_HANDOFF_VIGIL_AGENT_UUID="  AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE  ",
+        )
+        assert reloaded.DISPATCH_HANDOFF_VIGIL_AGENT_UUID == "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+    finally:
+        monkeypatch.delenv("BRIDGE_DISPATCH_HANDOFF_VIGIL_AGENT_UUID", raising=False)
+        importlib.reload(config)

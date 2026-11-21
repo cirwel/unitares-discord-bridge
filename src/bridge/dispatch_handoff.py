@@ -14,7 +14,8 @@ dispatch_beam); without that the message is just a second record.
 Rules this module holds to:
 
 * **Off unless fully configured.** Channel, mention and repository owners must
-  all be set. Anything missing or malformed disables the handoff.
+  all be set. Anything missing or malformed — including a malformed non-empty
+  ``BRIDGE_DISPATCH_HANDOFF_VIGIL_AGENT_UUID`` — disables the handoff.
 * **One class, named here.** Not configurable: widening what can start an
   agent run is a code change with a review, not an env var.
 * **Fixed wording.** The message becomes an agent's prompt. It is built from
@@ -28,13 +29,25 @@ Rules this module holds to:
   delivery cache as every finding, so the REST and WebSocket copies of one
   finding produce one handoff, across restarts.
 
-What this does NOT establish: that the finding really came from Vigil.
-Governance's ``/api/findings`` takes ``type``, ``finding_type`` and
-``agent_id`` from whoever holds its HTTP token, and the bridge has nothing
-better to check. So with the handoff on, any holder of that token can start a
-diagnose-only agent run against a PR of an allowlisted owner, with the fixed
-text below. That is the trust this feature extends, and it is why the text is
-fixed, the owners are allowlisted and the request stops at a diagnosis.
+What this establishes about finding origin depends on
+``BRIDGE_DISPATCH_HANDOFF_VIGIL_AGENT_UUID``:
+
+* **When set (recommended once Vigil's scoped findings token is deployed):**
+  the bridge requires governance's server-stamped provenance fields —
+  ``provenance_verified is True`` (strict boolean) AND
+  ``verified_actor_agent_uuid`` matching the configured Vigil agent UUID
+  (case-insensitive). That proves the finding was posted to governance with a
+  credential bound to that agent UUID rather than merely self-asserted via
+  ``agent_id="vigil"`` by another holder of the shared HTTP token. Findings
+  lacking verified provenance or attributed to a different verified actor are
+  ignored for handoff (their ordinary embed still posts).
+* **When unset or empty (backward-compatible default):** the bridge does NOT
+  establish that the finding really came from Vigil. Governance's
+  ``/api/findings`` takes ``type``, ``finding_type`` and ``agent_id`` from
+  whoever holds its shared HTTP token, so any holder of that token can start a
+  diagnose-only agent run against a PR of an allowlisted owner, with the fixed
+  text below. That residual trust is why the text is fixed, the owners are
+  allowlisted and the request stops at a diagnosis.
 
 The volume is bounded upstream (Vigil posts once per stall episode) and
 downstream (dispatch caps starts per trusted bot per hour).
@@ -75,16 +88,23 @@ class HandoffConfig:
     mention: str
     user_id: int
     owners: frozenset[str]
+    vigil_agent_uuid: str | None = None
 
 
 def parse_config(
-    channel_id: str | None, mention: str | None, owners: str | None
+    channel_id: str | None,
+    mention: str | None,
+    owners: str | None,
+    vigil_agent_uuid: str | None = None,
 ) -> HandoffConfig | None:
-    """Validate the three settings; ``None`` (handoff off) unless all are good.
+    """Validate the handoff settings; ``None`` (handoff off) unless all are good.
 
     ``mention`` must be a single user mention (``<@123...>``): not a role, not
     free text. ``owners`` is a comma-separated list of GitHub owners whose
-    repositories may be handed off; there is no wildcard.
+    repositories may be handed off; there is no wildcard. ``vigil_agent_uuid``
+    is optional: when non-empty it must be a canonical UUID (case-insensitive,
+    normalized to lowercase); a malformed non-empty value disables handoff
+    fail-closed.
     """
     raw_channel = (channel_id or "").strip()
     if _CHANNEL_RE.fullmatch(raw_channel) is None:
@@ -97,13 +117,40 @@ def parse_config(
     # is partly wrong is a misconfiguration, not a narrower allowlist.
     if any(_OWNER_RE.fullmatch(o) is None for o in entries):
         return None
+    normalized_vigil_uuid: str | None = None
+    if vigil_agent_uuid is not None:
+        if not isinstance(vigil_agent_uuid, str):
+            return None
+        raw_vigil_uuid = vigil_agent_uuid.strip()
+        if raw_vigil_uuid:
+            candidate = raw_vigil_uuid.lower()
+            if _UUID_RE.fullmatch(candidate) is None:
+                return None
+            normalized_vigil_uuid = candidate
     user_id = int(match.group(1))
     return HandoffConfig(
         channel_id=int(raw_channel),
         mention=f"<@{user_id}>",
         user_id=user_id,
         owners=frozenset(o.lower() for o in entries),
+        vigil_agent_uuid=normalized_vigil_uuid,
     )
+
+
+def _provenance_ok(event: dict, config: HandoffConfig) -> bool:
+    """True when ``event`` satisfies the configured Vigil provenance gate.
+
+    Unset ``vigil_agent_uuid`` preserves backward-compatible behavior. When
+    set, governance must have stamped ``provenance_verified`` as a strict
+    boolean ``True`` and ``verified_actor_agent_uuid`` matching the configured
+    UUID (case-insensitive).
+    """
+    if not config.vigil_agent_uuid:
+        return True
+    if event.get("provenance_verified") is not True:
+        return False
+    actor = event.get("verified_actor_agent_uuid")
+    return isinstance(actor, str) and actor.lower() == config.vigil_agent_uuid.lower()
 
 
 def _pr_identity(event: dict, owners: frozenset[str]) -> tuple[str, int] | None:
@@ -123,7 +170,9 @@ def handoff_text(event: Any, config: HandoffConfig | None) -> str | None:
     """The handoff message for ``event``, or ``None`` if it gets none.
 
     ``None`` for every event that is not exactly Vigil's per-PR stalled
-    draft-PR finding with a well-formed, allowlisted repository and number.
+    draft-PR finding with a well-formed, allowlisted repository and number
+    (and, when ``config.vigil_agent_uuid`` is set, server-verified actor
+    provenance matching that UUID).
     """
     if config is None or not isinstance(event, dict):
         return None
@@ -132,6 +181,8 @@ def handoff_text(event: Any, config: HandoffConfig | None) -> str | None:
     if event.get("finding_type") != HANDOFF_FINDING_TYPE:
         return None
     if event.get("agent_id") != HANDOFF_AGENT_ID:
+        return None
+    if not _provenance_ok(event, config):
         return None
     identity = _pr_identity(event, config.owners)
     if identity is None:
