@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 import discord
 import pytest
 
+from bridge import bot as bot_module
 from bridge.cache import FindingDeliveryCache
 from bridge.delivery import Outgoing, message_nonce
 from bridge.dispatch_handoff import (
@@ -90,7 +91,6 @@ def test_parse_config_fails_closed(channel, mention, owners):
 @pytest.mark.parametrize("raw_uuid, expected", [
     (None, None),
     ("", None),
-    ("   ", None),
     (VIGIL_UUID, VIGIL_UUID),
     (VIGIL_UUID.upper(), VIGIL_UUID),
     (f"  {VIGIL_UUID.upper()}  ", VIGIL_UUID),
@@ -102,6 +102,8 @@ def test_parse_config_vigil_uuid_optional_and_normalised(raw_uuid, expected):
 
 
 @pytest.mark.parametrize("bad_uuid", [
+    "   ",                                      # whitespace-only must fail closed
+    "\t\n",
     "not-a-uuid",
     "vigil",
     "*",
@@ -426,3 +428,76 @@ async def test_ws_subscriber_with_pinned_vigil_uuid_gates_handoff_on_provenance(
     )
     assert _names(queued) == ["residents", "residents", "beam-claude"]
     assert queued[2].source_event["event_id"] == 21
+
+
+# --- bot.py wiring and startup warning paths ----------------------------------
+
+
+def _patch_bot_handoff_env(
+    monkeypatch,
+    *,
+    channel: str = "",
+    mention: str = "",
+    owners: str = "",
+    vigil_uuid: str = "",
+) -> None:
+    monkeypatch.setattr(bot_module, "DISPATCH_HANDOFF_CHANNEL_ID", channel)
+    monkeypatch.setattr(bot_module, "DISPATCH_HANDOFF_MENTION", mention)
+    monkeypatch.setattr(bot_module, "DISPATCH_HANDOFF_REPO_OWNERS", owners)
+    monkeypatch.setattr(bot_module, "DISPATCH_HANDOFF_VIGIL_AGENT_UUID", vigil_uuid)
+
+
+def test_bot_load_handoff_config_passes_vigil_uuid(monkeypatch, caplog):
+    _patch_bot_handoff_env(
+        monkeypatch,
+        channel="424242",
+        mention=f"<@{BOT}>",
+        owners="acmeco",
+        vigil_uuid=f"  {VIGIL_UUID.upper()}  ",
+    )
+    with caplog.at_level("WARNING", logger="bridge"):
+        cfg = bot_module._load_handoff_config()
+    assert cfg == HandoffConfig(424242, f"<@{BOT}>", BOT, frozenset({"acmeco"}), VIGIL_UUID)
+    assert caplog.records == []
+
+
+@pytest.mark.parametrize("bad_uuid", ["not-a-uuid", "   "])
+def test_bot_load_handoff_config_warns_specifically_on_malformed_vigil_uuid(
+    monkeypatch, caplog, bad_uuid
+):
+    _patch_bot_handoff_env(
+        monkeypatch,
+        channel="424242",
+        mention=f"<@{BOT}>",
+        owners="acmeco",
+        vigil_uuid=bad_uuid,
+    )
+    with caplog.at_level("WARNING", logger="bridge"):
+        cfg = bot_module._load_handoff_config()
+    assert cfg is None
+    assert any(
+        "BRIDGE_DISPATCH_HANDOFF_VIGIL_AGENT_UUID is malformed" in rec.message
+        for rec in caplog.records
+    )
+
+
+def test_bot_load_handoff_config_warns_incomplete_on_uuid_only_config(monkeypatch, caplog):
+    _patch_bot_handoff_env(monkeypatch, vigil_uuid=VIGIL_UUID)
+    with caplog.at_level("WARNING", logger="bridge"):
+        cfg = bot_module._load_handoff_config()
+    assert cfg is None
+    assert any(
+        "Dispatch handoff settings are incomplete or malformed" in rec.message
+        for rec in caplog.records
+    )
+    assert not any(
+        "BRIDGE_DISPATCH_HANDOFF_VIGIL_AGENT_UUID is malformed" in rec.message
+        for rec in caplog.records
+    )
+
+
+def test_bot_load_handoff_config_silent_when_all_unset(monkeypatch, caplog):
+    _patch_bot_handoff_env(monkeypatch)
+    with caplog.at_level("WARNING", logger="bridge"):
+        assert bot_module._load_handoff_config() is None
+    assert caplog.records == []

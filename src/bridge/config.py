@@ -64,9 +64,11 @@ LUMEN_OFFLINE_MENTION = os.environ.get("LUMEN_OFFLINE_MENTION", "").strip()
 DISPATCH_HANDOFF_CHANNEL_ID = os.environ.get("BRIDGE_DISPATCH_HANDOFF_CHANNEL_ID", "").strip()
 DISPATCH_HANDOFF_MENTION = os.environ.get("BRIDGE_DISPATCH_HANDOFF_MENTION", "").strip()
 DISPATCH_HANDOFF_REPO_OWNERS = os.environ.get("BRIDGE_DISPATCH_HANDOFF_REPO_OWNERS", "").strip()
+# Keep raw value (no .strip()) so whitespace-only values like "   " are
+# distinguishable from unset/"" and fail closed in parse_vigil_agent_uuid().
 DISPATCH_HANDOFF_VIGIL_AGENT_UUID = os.environ.get(
     "BRIDGE_DISPATCH_HANDOFF_VIGIL_AGENT_UUID", ""
-).strip()
+)
 
 # File the bridge writes its own log to, through a WatchedFileHandler that
 # reopens the path after newsyslog renames it. Unset (the default) logs to

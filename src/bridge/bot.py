@@ -22,7 +22,11 @@ from bridge.config import (
     DISPATCH_HANDOFF_CHANNEL_ID, DISPATCH_HANDOFF_MENTION, DISPATCH_HANDOFF_REPO_OWNERS,
     DISPATCH_HANDOFF_VIGIL_AGENT_UUID,
 )
-from bridge.dispatch_handoff import parse_config as parse_handoff_config
+from bridge.dispatch_handoff import (
+    HandoffConfig,
+    parse_config as parse_handoff_config,
+    parse_vigil_agent_uuid,
+)
 from bridge.agent_labels import AgentLabelCache
 from bridge.agent_tags import AgentTagResolver
 from bridge.cache import BridgeCache, FindingDeliveryCache
@@ -124,6 +128,35 @@ audit_channel: discord.TextChannel | None = None
 _initialized: bool = False
 
 
+def _load_handoff_config() -> HandoffConfig | None:
+    """Parse module-level dispatch handoff settings; log why when disabled."""
+    cfg = parse_handoff_config(
+        DISPATCH_HANDOFF_CHANNEL_ID,
+        DISPATCH_HANDOFF_MENTION,
+        DISPATCH_HANDOFF_REPO_OWNERS,
+        DISPATCH_HANDOFF_VIGIL_AGENT_UUID,
+    )
+    if cfg is not None:
+        return cfg
+    valid_vigil_uuid, _ = parse_vigil_agent_uuid(DISPATCH_HANDOFF_VIGIL_AGENT_UUID)
+    if not valid_vigil_uuid:
+        log.warning(
+            "BRIDGE_DISPATCH_HANDOFF_VIGIL_AGENT_UUID is malformed — dispatch "
+            "handoff disabled (expected a canonical UUID or unset)"
+        )
+    elif (
+        DISPATCH_HANDOFF_CHANNEL_ID
+        or DISPATCH_HANDOFF_MENTION
+        or DISPATCH_HANDOFF_REPO_OWNERS
+        or DISPATCH_HANDOFF_VIGIL_AGENT_UUID
+    ):
+        log.warning(
+            "Dispatch handoff settings are incomplete or malformed — handoff "
+            "disabled (need a channel id, one <@user> mention and repo owners)"
+        )
+    return None
+
+
 @bot.event
 async def on_ready():
     global cache, event_poller, ws_subscriber, hud_updater, lumen_poller, iteration_poller, digest_poller, audit_channel, _initialized
@@ -198,12 +231,7 @@ async def on_ready():
     # Dispatch handoff: off unless all required settings (and optional Vigil
     # UUID, if set) parse AND the channel is a text channel this bot can see.
     # Looked up by id; the operator names it.
-    handoff_config = parse_handoff_config(
-        DISPATCH_HANDOFF_CHANNEL_ID,
-        DISPATCH_HANDOFF_MENTION,
-        DISPATCH_HANDOFF_REPO_OWNERS,
-        DISPATCH_HANDOFF_VIGIL_AGENT_UUID,
-    )
+    handoff_config = _load_handoff_config()
     handoff_ch: discord.TextChannel | None = None
     if handoff_config is not None:
         ch = bot.get_channel(handoff_config.channel_id)
@@ -250,17 +278,6 @@ async def on_ready():
                     "dispatch handoff disabled"
                 )
                 handoff_config = None
-    elif (
-        DISPATCH_HANDOFF_CHANNEL_ID
-        or DISPATCH_HANDOFF_MENTION
-        or DISPATCH_HANDOFF_REPO_OWNERS
-        or DISPATCH_HANDOFF_VIGIL_AGENT_UUID
-    ):
-        log.warning(
-            "Dispatch handoff settings are incomplete or malformed — handoff "
-            "disabled (need a channel id, one <@user> mention, repo owners, "
-            "and an optional valid Vigil agent UUID)"
-        )
 
     if activity_ch and signals_ch and alerts_ch:
         # Persisted so a restart cannot re-post findings the WS path already

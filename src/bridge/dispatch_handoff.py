@@ -91,6 +91,25 @@ class HandoffConfig:
     vigil_agent_uuid: str | None = None
 
 
+def parse_vigil_agent_uuid(vigil_agent_uuid: str | None) -> tuple[bool, str | None]:
+    """Validate the optional Vigil agent UUID setting.
+
+    Returns ``(True, None)`` only when unset (``None``) or exact empty ``""``
+    (unpinned compatibility mode). A valid canonical UUID (case-insensitive,
+    optional surrounding whitespace) returns ``(True, normalized_lower_uuid)``.
+    Any other value — including whitespace-only strings such as ``"   "`` —
+    returns ``(False, None)`` so callers fail closed.
+    """
+    if vigil_agent_uuid is None or vigil_agent_uuid == "":
+        return True, None
+    if not isinstance(vigil_agent_uuid, str):
+        return False, None
+    candidate = vigil_agent_uuid.strip().lower()
+    if not candidate or _UUID_RE.fullmatch(candidate) is None:
+        return False, None
+    return True, candidate
+
+
 def parse_config(
     channel_id: str | None,
     mention: str | None,
@@ -102,9 +121,9 @@ def parse_config(
     ``mention`` must be a single user mention (``<@123...>``): not a role, not
     free text. ``owners`` is a comma-separated list of GitHub owners whose
     repositories may be handed off; there is no wildcard. ``vigil_agent_uuid``
-    is optional: when non-empty it must be a canonical UUID (case-insensitive,
-    normalized to lowercase); a malformed non-empty value disables handoff
-    fail-closed.
+    is optional: only ``None`` or exact ``""`` leaves provenance unpinned; a
+    valid canonical UUID is normalized to lowercase, and any other value
+    (including whitespace-only) disables handoff fail-closed.
     """
     raw_channel = (channel_id or "").strip()
     if _CHANNEL_RE.fullmatch(raw_channel) is None:
@@ -117,16 +136,9 @@ def parse_config(
     # is partly wrong is a misconfiguration, not a narrower allowlist.
     if any(_OWNER_RE.fullmatch(o) is None for o in entries):
         return None
-    normalized_vigil_uuid: str | None = None
-    if vigil_agent_uuid is not None:
-        if not isinstance(vigil_agent_uuid, str):
-            return None
-        raw_vigil_uuid = vigil_agent_uuid.strip()
-        if raw_vigil_uuid:
-            candidate = raw_vigil_uuid.lower()
-            if _UUID_RE.fullmatch(candidate) is None:
-                return None
-            normalized_vigil_uuid = candidate
+    valid_vigil_uuid, normalized_vigil_uuid = parse_vigil_agent_uuid(vigil_agent_uuid)
+    if not valid_vigil_uuid:
+        return None
     user_id = int(match.group(1))
     return HandoffConfig(
         channel_id=int(raw_channel),
