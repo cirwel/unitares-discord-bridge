@@ -143,7 +143,7 @@ skipped.
 
 ### Handing a finding to a dispatch agent
 
-Off by default. When all three of these are set, Vigil's per-PR
+Off by default. When the first three variables below are set, Vigil's per-PR
 stalled-draft-PR finding (`vigil_finding`, `finding_type=stalled_draft_pr`) is
 also posted as a plain message that @-mentions a dispatch bot, so an agent is
 started to look at the PR:
@@ -153,10 +153,21 @@ started to look at the PR:
 | `BRIDGE_DISPATCH_HANDOFF_CHANNEL_ID` | Id of a channel where that dispatch bot starts sessions. |
 | `BRIDGE_DISPATCH_HANDOFF_MENTION` | The dispatch bot as one user mention, `<@123456789>`. Not a role. |
 | `BRIDGE_DISPATCH_HANDOFF_REPO_OWNERS` | GitHub owners whose PRs may be handed off, comma-separated. No wildcard. |
+| `BRIDGE_DISPATCH_HANDOFF_VIGIL_AGENT_UUID` | *(Optional)* Canonical UUID of Vigil's governance agent. When set, only findings with server-verified provenance matching this UUID trigger a handoff; a malformed non-empty value disables handoff fail-closed. |
 
 The dispatch bot must also list this bridge's bot id in its own
 `DISPATCH_TRIGGER_BOT_IDS`; otherwise the message starts nothing. Each handoff
 starts an agent run, so turning this on is a spending decision.
+
+**Provenance verification:** When `BRIDGE_DISPATCH_HANDOFF_VIGIL_AGENT_UUID` is
+set, the bridge requires governance's server-stamped `provenance_verified` to be
+`true` (strict boolean) and `verified_actor_agent_uuid` to match the configured
+Vigil UUID (case-insensitively). That proves the finding was posted with a
+credential bound to Vigil's agent UUID rather than self-asserted via
+`agent_id=vigil`. When unset or empty (preserved for backward compatibility
+until Vigil's scoped findings token is deployed), the bridge does not verify
+finding origin: any holder of governance's shared HTTP token can emit a
+matching finding and trigger the diagnose-only handoff.
 
 The message is fixed text plus the repository, the PR number and the PR's
 agent signature, each validated. The finding's own message and link are never

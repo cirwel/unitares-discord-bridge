@@ -7,16 +7,24 @@ from unittest.mock import AsyncMock, MagicMock
 import discord
 import pytest
 
+from bridge import bot as bot_module
 from bridge.cache import FindingDeliveryCache
 from bridge.delivery import Outgoing, message_nonce
 from bridge.dispatch_handoff import (
     HandoffConfig, handoff_outgoing, handoff_text, parse_config,
 )
 from bridge.event_poller import EventPoller
+from bridge.ws_events import WSEventSubscriber
 
 BOT = 111222333444555666
 UUID = "11111111-2222-3333-4444-555555555555"
+VIGIL_UUID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+OTHER_UUID = "99999999-8888-7777-6666-555555555555"
 CFG = HandoffConfig(channel_id=42, mention=f"<@{BOT}>", user_id=BOT, owners=frozenset({"acmeco"}))
+CFG_PINNED = HandoffConfig(
+    channel_id=42, mention=f"<@{BOT}>", user_id=BOT,
+    owners=frozenset({"acmeco"}), vigil_agent_uuid=VIGIL_UUID,
+)
 
 
 def _finding(**over) -> dict:
@@ -78,6 +86,36 @@ def test_nickname_mention_form_is_normalised():
 ])
 def test_parse_config_fails_closed(channel, mention, owners):
     assert parse_config(channel, mention, owners) is None
+
+
+@pytest.mark.parametrize("raw_uuid, expected", [
+    (None, None),
+    ("", None),
+    (VIGIL_UUID, VIGIL_UUID),
+    (VIGIL_UUID.upper(), VIGIL_UUID),
+    (f"  {VIGIL_UUID.upper()}  ", VIGIL_UUID),
+])
+def test_parse_config_vigil_uuid_optional_and_normalised(raw_uuid, expected):
+    cfg = parse_config("424242", f"<@{BOT}>", "acmeco", raw_uuid)
+    assert cfg is not None
+    assert cfg.vigil_agent_uuid == expected
+
+
+@pytest.mark.parametrize("bad_uuid", [
+    "   ",                                      # whitespace-only must fail closed
+    "\t\n",
+    "not-a-uuid",
+    "vigil",
+    "*",
+    "aaaaaaaabbbbccccddddeeeeeeeeeeee",         # missing hyphens
+    "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeeg",     # non-hex character
+    "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeee",      # too short
+    f"{VIGIL_UUID}-extra",
+    f"{VIGIL_UUID}\nextra",
+    12345,
+])
+def test_parse_config_malformed_vigil_uuid_fails_closed(bad_uuid):
+    assert parse_config("424242", f"<@{BOT}>", "acmeco", bad_uuid) is None
 
 
 # --- which events get a handoff -----------------------------------------------
@@ -290,3 +328,176 @@ async def test_poller_hands_off_nothing_for_other_findings():
     poller, queued = _poller(events, handoff=True)
     await poller._poll_loop_once()
     assert "beam-claude" not in _names(queued)
+
+
+# --- provenance verification gate ---------------------------------------------
+
+
+@pytest.mark.parametrize("over", [
+    {},                                                                     # missing both fields
+    {"provenance_verified": None, "verified_actor_agent_uuid": VIGIL_UUID},
+    {"provenance_verified": False, "verified_actor_agent_uuid": VIGIL_UUID},
+    {"provenance_verified": 1, "verified_actor_agent_uuid": VIGIL_UUID},    # truthy int
+    {"provenance_verified": "true", "verified_actor_agent_uuid": VIGIL_UUID},
+    {"provenance_verified": "True", "verified_actor_agent_uuid": VIGIL_UUID},
+    {"provenance_verified": [True], "verified_actor_agent_uuid": VIGIL_UUID},
+    {"provenance_verified": True},                                          # missing actor uuid
+    {"provenance_verified": True, "verified_actor_agent_uuid": None},
+    {"provenance_verified": True, "verified_actor_agent_uuid": ""},
+    {"provenance_verified": True, "verified_actor_agent_uuid": 123},
+    {"provenance_verified": True, "verified_actor_agent_uuid": OTHER_UUID},
+    {"provenance_verified": True, "verified_actor_agent_uuid": f"{VIGIL_UUID} "},
+    {"provenance_verified": True, "verified_actor_agent_uuid": f"{VIGIL_UUID}\n"},
+])
+def test_provenance_gate_rejects_unverified_or_mismatched_events(over):
+    event = _finding(**over)
+    assert handoff_text(event, CFG_PINNED) is None
+    assert handoff_outgoing(event, _channel("beam-claude", 42), CFG_PINNED) is None
+
+
+@pytest.mark.parametrize("actor_uuid", [VIGIL_UUID, VIGIL_UUID.upper()])
+def test_provenance_gate_accepts_server_verified_matching_event(actor_uuid):
+    event = _finding(provenance_verified=True, verified_actor_agent_uuid=actor_uuid)
+    text = handoff_text(event, CFG_PINNED)
+    assert text is not None and text.startswith(f"<@{BOT}> ")
+    item = handoff_outgoing(event, _channel("beam-claude", 42), CFG_PINNED)
+    assert isinstance(item, Outgoing) and item.content == text
+
+
+@pytest.mark.parametrize("over", [
+    {},
+    {"provenance_verified": False},
+    {"provenance_verified": False, "verified_actor_agent_uuid": OTHER_UUID},
+])
+def test_unset_vigil_uuid_preserves_backward_compatibility(over):
+    event = _finding(**over)
+    assert handoff_text(event, CFG) is not None
+    assert isinstance(handoff_outgoing(event, _channel("beam-claude", 42), CFG), Outgoing)
+
+
+@pytest.mark.asyncio
+async def test_poller_with_pinned_vigil_uuid_gates_handoff_on_provenance():
+    unverified = _finding(event_id=10)
+    verified = _finding(
+        event_id=11,
+        provenance_verified=True,
+        verified_actor_agent_uuid=VIGIL_UUID,
+    )
+    gov = MagicMock()
+    gov.fetch_events = AsyncMock(return_value=[unverified, verified])
+    gov.record_bridge_event = AsyncMock(return_value=True)
+    gov.consecutive_failures = 0
+    cache = MagicMock()
+    cache.get_event_cursor = AsyncMock(return_value=0)
+    cache.set_event_cursor = AsyncMock()
+    poller = EventPoller(
+        gov, cache, _channel("activity", 1), _channel("signals", 2), _channel("alerts", 3),
+        residents_channel=_channel("residents", 4),
+        handoff_channel=_channel("beam-claude", 42),
+        handoff_config=CFG_PINNED,
+    )
+    queued: list = []
+    poller._message_queue.put_nowait = queued.append
+    await poller._poll_loop_once()
+    # Both findings post their ordinary embed to #residents; only the verified
+    # one also queues a dispatch handoff to #beam-claude.
+    assert _names(queued) == ["residents", "residents", "beam-claude"]
+    assert queued[2].source_event["event_id"] == 11
+
+
+@pytest.mark.asyncio
+async def test_ws_subscriber_with_pinned_vigil_uuid_gates_handoff_on_provenance():
+    sub = WSEventSubscriber(
+        "http://localhost:8767",
+        _channel("activity", 1),
+        _channel("signals", 2),
+        _channel("alerts", 3),
+        residents_channel=_channel("residents", 4),
+        handoff_channel=_channel("beam-claude", 42),
+        handoff_config=CFG_PINNED,
+    )
+    queued: list = []
+    sub._send_queue.put_nowait = queued.append
+    await sub._dispatch(_finding(event_id=20))
+    await sub._dispatch(
+        _finding(
+            event_id=21,
+            provenance_verified=True,
+            verified_actor_agent_uuid=VIGIL_UUID.upper(),
+        )
+    )
+    assert _names(queued) == ["residents", "residents", "beam-claude"]
+    assert queued[2].source_event["event_id"] == 21
+
+
+# --- bot.py wiring and startup warning paths ----------------------------------
+
+
+def _patch_bot_handoff_env(
+    monkeypatch,
+    *,
+    channel: str = "",
+    mention: str = "",
+    owners: str = "",
+    vigil_uuid: str = "",
+) -> None:
+    monkeypatch.setattr(bot_module, "DISPATCH_HANDOFF_CHANNEL_ID", channel)
+    monkeypatch.setattr(bot_module, "DISPATCH_HANDOFF_MENTION", mention)
+    monkeypatch.setattr(bot_module, "DISPATCH_HANDOFF_REPO_OWNERS", owners)
+    monkeypatch.setattr(bot_module, "DISPATCH_HANDOFF_VIGIL_AGENT_UUID", vigil_uuid)
+
+
+def test_bot_load_handoff_config_passes_vigil_uuid(monkeypatch, caplog):
+    _patch_bot_handoff_env(
+        monkeypatch,
+        channel="424242",
+        mention=f"<@{BOT}>",
+        owners="acmeco",
+        vigil_uuid=f"  {VIGIL_UUID.upper()}  ",
+    )
+    with caplog.at_level("WARNING", logger="bridge"):
+        cfg = bot_module._load_handoff_config()
+    assert cfg == HandoffConfig(424242, f"<@{BOT}>", BOT, frozenset({"acmeco"}), VIGIL_UUID)
+    assert caplog.records == []
+
+
+@pytest.mark.parametrize("bad_uuid", ["not-a-uuid", "   "])
+def test_bot_load_handoff_config_warns_specifically_on_malformed_vigil_uuid(
+    monkeypatch, caplog, bad_uuid
+):
+    _patch_bot_handoff_env(
+        monkeypatch,
+        channel="424242",
+        mention=f"<@{BOT}>",
+        owners="acmeco",
+        vigil_uuid=bad_uuid,
+    )
+    with caplog.at_level("WARNING", logger="bridge"):
+        cfg = bot_module._load_handoff_config()
+    assert cfg is None
+    assert any(
+        "BRIDGE_DISPATCH_HANDOFF_VIGIL_AGENT_UUID is malformed" in rec.message
+        for rec in caplog.records
+    )
+
+
+def test_bot_load_handoff_config_warns_incomplete_on_uuid_only_config(monkeypatch, caplog):
+    _patch_bot_handoff_env(monkeypatch, vigil_uuid=VIGIL_UUID)
+    with caplog.at_level("WARNING", logger="bridge"):
+        cfg = bot_module._load_handoff_config()
+    assert cfg is None
+    assert any(
+        "Dispatch handoff settings are incomplete or malformed" in rec.message
+        for rec in caplog.records
+    )
+    assert not any(
+        "BRIDGE_DISPATCH_HANDOFF_VIGIL_AGENT_UUID is malformed" in rec.message
+        for rec in caplog.records
+    )
+
+
+def test_bot_load_handoff_config_silent_when_all_unset(monkeypatch, caplog):
+    _patch_bot_handoff_env(monkeypatch)
+    with caplog.at_level("WARNING", logger="bridge"):
+        assert bot_module._load_handoff_config() is None
+    assert caplog.records == []
